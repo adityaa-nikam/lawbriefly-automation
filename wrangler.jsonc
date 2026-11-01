@@ -10,7 +10,14 @@
 	"observability": {
 		"enabled": true
 	},
-	"upload_source_maps": true
+	"upload_source_maps": true,
+	/**
+	 * Cron Triggers (UTC)
+	 * "30 0 * * *" executes daily at 00:30 UTC (06:00 AM IST)
+	 */
+	"triggers": {
+		"crons": ["30 0 * * *"]
+	}
 	/**
 	 * Smart Placement
 	 * https://developers.cloudflare.com/workers/configuration/smart-placement/#smart-placement
