@@ -10,6 +10,7 @@ import { handleGenerateContent } from "./services/content-generation";
 import { handleRenderCarousel } from "./services/carousel-rendering";
 import { handleStoreCarousel } from "./services/carousel-persistence";
 import { handleNotifyEditor, handleTelegramWebhook } from "./services/editorial-approval";
+import { handlePublishInstagram } from "./services/instagram-publishing";
 
 export interface Env {
 	LAWBRIEFLY_API_URL?: string;
@@ -28,6 +29,10 @@ export interface Env {
 	TELEGRAM_ALLOWED_USER_IDS?: string;
 	TELEGRAM_WEBHOOK_SECRET?: string;
 	TELEGRAM_APPROVAL_TTL_HOURS?: string;
+	INSTAGRAM_AUTH_MODE?: string;
+	INSTAGRAM_ACCESS_TOKEN?: string;
+	INSTAGRAM_ACCOUNT_ID?: string;
+	INSTAGRAM_GRAPH_VERSION?: string;
 }
 
 export default {
@@ -143,6 +148,10 @@ export default {
 
 		if (url.pathname === "/api/webhooks/telegram") {
 			return await handleTelegramWebhook(request, env);
+		}
+
+		if (url.pathname === "/api/ai/publish-instagram") {
+			return await handlePublishInstagram(request, env);
 		}
 
 		if (url.pathname === "/api/health/supabase" && request.method === "GET") {

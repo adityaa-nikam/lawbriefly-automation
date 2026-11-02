@@ -18,6 +18,10 @@ interface __BaseEnv_Env {
 	TELEGRAM_ALLOWED_USER_IDS?: string;
 	TELEGRAM_WEBHOOK_SECRET?: string;
 	TELEGRAM_APPROVAL_TTL_HOURS?: string;
+	INSTAGRAM_AUTH_MODE?: string;
+	INSTAGRAM_ACCESS_TOKEN?: string;
+	INSTAGRAM_ACCOUNT_ID?: string;
+	INSTAGRAM_GRAPH_VERSION?: string;
 }
 declare namespace Cloudflare {
 	interface GlobalProps {

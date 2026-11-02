@@ -130,6 +130,37 @@ import {
 	type NotifyEditorResult,
 	type ProcessCallbackResult,
 } from "../src/services/editorial-approval";
+import {
+	isValidJpegBuffer,
+	getJpegDimensions,
+	validateJpegSlide,
+	createSyntheticJpegBuffer,
+	sanitizeMetaError,
+	buildGraphApiUrl,
+	getValidatedInstagramConfig,
+	verifyInstagramCredentials,
+	validatePostForPublishing,
+	convertPngToJpegWithBrowser,
+	convertSlidePngsToJpegs,
+	preparePublishingAssets,
+	createCarouselItemContainer,
+	createCarouselContainer,
+	getContainerStatus,
+	pollContainerUntilReady,
+	publishMediaContainer,
+	getPublishedMediaDetails,
+	publishApprovedCarousel,
+	handlePublishInstagram,
+	DEFAULT_INSTAGRAM_GRAPH_VERSION,
+	INSTAGRAM_LOGIN_API_BASE_URL,
+	FACEBOOK_LOGIN_API_BASE_URL,
+	SIGNED_URL_PUBLISH_EXPIRY_SECONDS,
+	CANVAS_WIDTH,
+	CANVAS_HEIGHT,
+	MAX_INSTAGRAM_IMAGE_SIZE_BYTES,
+	type InstagramPublishingConfig,
+	type InstagramAuthMode,
+} from "../src/services/instagram-publishing";
 
 const IncomingRequest = Request<unknown, IncomingRequestCfProperties>;
 
@@ -12553,6 +12584,776 @@ describe("Task 10 - Global Hot Legal Topic Selection Using Groq", () => {
 					expect(json.success).toBe(true);
 					expect(json.decision_status).toBe("approved");
 					expect(json.action).toBe("approve");
+				});
+			});
+		});
+
+		describe("Task 17A — Instagram Graph API Integration Foundation", () => {
+			const mockInstagramDevEnv: Env = {
+				LAWBRIEFLY_API_URL: "https://api.lawbriefly.test/v1/news",
+				LAWBRIEFLY_API_KEY: "super-secret-test-key-12345",
+				SUPABASE_URL: "https://test-project.supabase.co",
+				SUPABASE_SECRET_KEY: "sb_secret_test_key_123456",
+				APP_ENV: "development",
+				GROQ_API_KEY: "gsk_test_12345",
+				GROQ_MODEL: "llama-3.3-70b-versatile",
+				OPENROUTER_API_KEY: "sk-or-test-12345",
+				MERCURY_MODEL: "inception/mercury-decide",
+				JINA_API_KEY: "jina_test_12345",
+				MYBROWSER: { fetch: vi.fn() } as any,
+				INSTAGRAM_AUTH_MODE: "facebook_login",
+				INSTAGRAM_ACCESS_TOKEN: "mock_test_instagram_token_xyz987",
+				INSTAGRAM_ACCOUNT_ID: "17841400000000000",
+				INSTAGRAM_GRAPH_VERSION: "v22.0",
+			};
+
+			const mockInstagramDirectEnv: Env = {
+				...mockInstagramDevEnv,
+				INSTAGRAM_AUTH_MODE: "instagram_login",
+				INSTAGRAM_GRAPH_VERSION: "v26.0",
+			};
+
+			const mockInstagramProdEnv: Env = {
+				...mockInstagramDevEnv,
+				APP_ENV: "production",
+			};
+
+			function createMockPublishingSupabase(options: {
+				post?: any;
+				assets?: any[];
+				downloadError?: Error;
+				uploadError?: Error;
+				updateError?: Error;
+			} = {}) {
+				let post = options.post
+					? { ...options.post }
+					: {
+							id: "17000000-0000-0000-0000-000000001700",
+							post_status: "approved",
+							human_review_required: true,
+							carousel_slide_count: 5,
+							instagram_caption: "GST Council recommends omitting Section 69 arrest powers and raising prosecution threshold to Rs 5 crore.",
+							hashtags: ["LawBriefly", "TaxLaw", "GST"],
+					  };
+
+				const defaultAssets = [
+					{ id: "a1", post_id: post.id, asset_type: "slide", asset_key: "slide-01-cover.png", slide_number: 1, storage_bucket: "lawbriefly-carousel-assets", storage_path: `posts/${post.id}/slide-01.png` },
+					{ id: "a2", post_id: post.id, asset_type: "slide", asset_key: "slide-02-what-happened.png", slide_number: 2, storage_bucket: "lawbriefly-carousel-assets", storage_path: `posts/${post.id}/slide-02.png` },
+					{ id: "a3", post_id: post.id, asset_type: "slide", asset_key: "slide-03-legal-details.png", slide_number: 3, storage_bucket: "lawbriefly-carousel-assets", storage_path: `posts/${post.id}/slide-03.png` },
+					{ id: "a4", post_id: post.id, asset_type: "slide", asset_key: "slide-04-why-it-matters.png", slide_number: 4, storage_bucket: "lawbriefly-carousel-assets", storage_path: `posts/${post.id}/slide-04.png` },
+					{ id: "a5", post_id: post.id, asset_type: "slide", asset_key: "slide-05-sources.png", slide_number: 5, storage_bucket: "lawbriefly-carousel-assets", storage_path: `posts/${post.id}/slide-05.png` },
+				];
+
+				const assets = options.assets ? [...options.assets] : defaultAssets;
+				const uploadedFiles = new Map<string, Uint8Array>();
+				let capturedSignedUrlExpiry: number | null = null;
+
+				const mockClient = {
+					from: vi.fn().mockImplementation((table: string) => {
+						if (table === "social_content_posts") {
+							return {
+								select: vi.fn().mockReturnValue({
+									eq: vi.fn().mockImplementation((field: string, val: string) => ({
+										single: vi.fn().mockImplementation(async () => {
+											if (val === post.id) return { data: { ...post }, error: null };
+											return { data: null, error: new Error("Post not found") };
+										}),
+									})),
+								}),
+								update: vi.fn().mockImplementation((updates: any) => ({
+									eq: vi.fn().mockImplementation(async (field: string, val: string) => {
+										if (options.updateError) return { data: null, error: options.updateError };
+										if (val === post.id) {
+											post = { ...post, ...updates };
+											return { data: { ...post }, error: null };
+										}
+										return { data: null, error: new Error("Post not found") };
+									}),
+								})),
+							};
+						}
+
+						if (table === "social_content_assets") {
+							return {
+								select: vi.fn().mockReturnValue({
+									eq: vi.fn().mockImplementation((field1: string, val1: string) => ({
+										eq: vi.fn().mockImplementation((field2: string, val2: string) => ({
+											order: vi.fn().mockImplementation(async () => {
+												return { data: [...assets], error: null };
+											}),
+										})),
+										order: vi.fn().mockImplementation(async () => {
+											return { data: [...assets], error: null };
+										}),
+									})),
+								}),
+							};
+						}
+
+						return {
+							select: vi.fn().mockReturnThis(),
+							eq: vi.fn().mockReturnThis(),
+						};
+					}),
+					storage: {
+						from: vi.fn().mockImplementation((bucket: string) => ({
+							download: vi.fn().mockImplementation(async (storagePath: string) => {
+								if (options.downloadError) {
+									return { data: null, error: options.downloadError };
+								}
+								// Return synthetic PNG bytes
+								const syntheticPng = new Uint8Array([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, ...new Array(500).fill(1)]);
+								return {
+									data: {
+										arrayBuffer: async () => syntheticPng.buffer,
+									},
+									error: null,
+								};
+							}),
+							upload: vi.fn().mockImplementation(async (path: string, bytes: Uint8Array) => {
+								if (options.uploadError) {
+									return { data: null, error: options.uploadError };
+								}
+								uploadedFiles.set(path, bytes);
+								return { data: { path }, error: null };
+							}),
+							createSignedUrl: vi.fn().mockImplementation(async (path: string, expiry: number) => {
+								capturedSignedUrlExpiry = expiry;
+								return {
+									data: { signedUrl: `https://test-project.supabase.co/storage/v1/object/sign/lawbriefly-carousel-assets/${path}?token=mock_secret_signed_token` },
+									error: null,
+								};
+							}),
+						})),
+					},
+				};
+
+				return {
+					mockClient,
+					getPost: () => ({ ...post }),
+					uploadedFiles,
+					getCapturedSignedUrlExpiry: () => capturedSignedUrlExpiry,
+				};
+			}
+
+			function setupMetaFetchMock(options: {
+				shouldFailAuth?: boolean;
+				shouldFailContainer?: boolean;
+				shouldFailStatus?: boolean;
+				statusResult?: "FINISHED" | "IN_PROGRESS" | "ERROR" | "EXPIRED";
+				customStatusSequence?: Array<"IN_PROGRESS" | "FINISHED" | "ERROR" | "EXPIRED">;
+			} = {}) {
+				let statusIndex = 0;
+				const calls: Array<{ url: string; method: string; body?: any; headers?: any }> = [];
+
+				const fetchSpy = vi.spyOn(globalThis, "fetch").mockImplementation(async (input: any, init?: any) => {
+					const url = typeof input === "string" ? input : input.url;
+					const method = init?.method || "GET";
+					const headers = init?.headers || {};
+					let body: any = undefined;
+					if (init?.body) {
+						try {
+							body = JSON.parse(init.body);
+						} catch {
+							body = init.body;
+						}
+					}
+
+					calls.push({ url, method, body, headers });
+
+					if (options.shouldFailAuth) {
+						return new Response(
+							JSON.stringify({
+								error: {
+									message: "Invalid OAuth access token - Cannot parse access token",
+									type: "OAuthException",
+									code: 190,
+									fbtrace_id: "trace_mock_123",
+								},
+							}),
+							{ status: 401, headers: { "Content-Type": "application/json" } }
+						);
+					}
+
+					// GET account verification
+					if (method === "GET" && url.includes("?fields=id,username,name")) {
+						return new Response(
+							JSON.stringify({
+								id: "17841400000000000",
+								username: "lawbriefly",
+								name: "LawBriefly Legal News",
+							}),
+							{ status: 200, headers: { "Content-Type": "application/json" } }
+						);
+					}
+
+					// POST carousel child item container
+					if (method === "POST" && url.endsWith("/media") && body?.is_carousel_item) {
+						if (options.shouldFailContainer) {
+							return new Response(
+								JSON.stringify({
+									error: {
+										message: "The image format is not supported. Please use JPEG.",
+										type: "OAuthException",
+										code: 36003,
+										error_subcode: 2207001,
+									},
+								}),
+								{ status: 400, headers: { "Content-Type": "application/json" } }
+							);
+						}
+						const randId = `child_container_${Math.floor(Math.random() * 900000) + 100000}`;
+						return new Response(JSON.stringify({ id: randId }), {
+							status: 200,
+							headers: { "Content-Type": "application/json" },
+						});
+					}
+
+					// POST parent carousel container
+					if (method === "POST" && url.endsWith("/media") && body?.media_type === "CAROUSEL") {
+						return new Response(JSON.stringify({ id: "parent_carousel_container_999" }), {
+							status: 200,
+							headers: { "Content-Type": "application/json" },
+						});
+					}
+
+					// GET container processing status
+					if (method === "GET" && url.includes("fields=status_code,status")) {
+						if (options.shouldFailStatus) {
+							return new Response(
+								JSON.stringify({
+									error: { message: "Container not found", code: 100 },
+								}),
+								{ status: 404, headers: { "Content-Type": "application/json" } }
+							);
+						}
+
+						let statusCode: "FINISHED" | "IN_PROGRESS" | "ERROR" | "EXPIRED" = "FINISHED";
+						if (options.customStatusSequence && options.customStatusSequence.length > 0) {
+							statusCode = options.customStatusSequence[Math.min(statusIndex, options.customStatusSequence.length - 1)];
+							statusIndex++;
+						} else if (options.statusResult) {
+							statusCode = options.statusResult;
+						}
+
+						return new Response(
+							JSON.stringify({
+								id: "parent_carousel_container_999",
+								status_code: statusCode,
+								status: statusCode === "ERROR" ? "Corrupted media stream" : undefined,
+							}),
+							{ status: 200, headers: { "Content-Type": "application/json" } }
+						);
+					}
+
+					// POST media_publish
+					if (method === "POST" && url.endsWith("/media_publish")) {
+						return new Response(JSON.stringify({ id: "17999999999999999" }), {
+							status: 200,
+							headers: { "Content-Type": "application/json" },
+						});
+					}
+
+					// GET published media details
+					if (method === "GET" && url.includes("fields=id,permalink,media_type,timestamp")) {
+						return new Response(
+							JSON.stringify({
+								id: "17999999999999999",
+								permalink: "https://www.instagram.com/p/DB_test_lawbriefly_123/",
+								media_type: "CAROUSEL_ALBUM",
+								timestamp: "2026-11-02T05:30:00+0000",
+							}),
+							{ status: 200, headers: { "Content-Type": "application/json" } }
+						);
+					}
+
+					return new Response(JSON.stringify({ error: "Unhandled test route" }), {
+						status: 500,
+						headers: { "Content-Type": "application/json" },
+					});
+				});
+
+				return { fetchSpy, calls };
+			}
+
+			describe("JPEG Format Validation & Dimension Parsing", () => {
+				it("1. isValidJpegBuffer identifies valid JPEG magic bytes and rejects invalid buffers", () => {
+					const validJpeg = createSyntheticJpegBuffer(1080, 1350);
+					expect(isValidJpegBuffer(validJpeg)).toBe(true);
+
+					// Truncated buffer
+					expect(isValidJpegBuffer(new Uint8Array([0xff, 0xd8]))).toBe(false);
+
+					// Non-JPEG buffer (e.g. PNG magic bytes)
+					const pngBytes = new Uint8Array([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]);
+					expect(isValidJpegBuffer(pngBytes)).toBe(false);
+
+					// Empty buffer
+					expect(isValidJpegBuffer(new Uint8Array([]))).toBe(false);
+				});
+
+				it("2. getJpegDimensions accurately parses exact 1080x1350 dimensions from SOF marker", () => {
+					const valid1080x1350 = createSyntheticJpegBuffer(1080, 1350);
+					const dimensions = getJpegDimensions(valid1080x1350);
+					expect(dimensions).not.toBeNull();
+					expect(dimensions?.width).toBe(1080);
+					expect(dimensions?.height).toBe(1350);
+
+					// Custom dimensions
+					const customJpeg = createSyntheticJpegBuffer(800, 1000);
+					const customDims = getJpegDimensions(customJpeg);
+					expect(customDims?.width).toBe(800);
+					expect(customDims?.height).toBe(1000);
+
+					// Invalid buffer
+					expect(getJpegDimensions(new Uint8Array([1, 2, 3]))).toBeNull();
+				});
+
+				it("3. validateJpegSlide enforces strict Meta carousel requirements (1080x1350, <8MB, JPEG)", () => {
+					const validSlide = createSyntheticJpegBuffer(1080, 1350);
+					const result = validateJpegSlide(validSlide, 1);
+					expect(result.valid).toBe(true);
+					expect(result.error).toBeUndefined();
+
+					// Wrong aspect ratio / dimensions
+					const squareSlide = createSyntheticJpegBuffer(1080, 1080);
+					const squareResult = validateJpegSlide(squareSlide, 2);
+					expect(squareResult.valid).toBe(false);
+					expect(squareResult.error).toContain("dimensions 1080x1080 do not match required 1080x1350");
+
+					// Non-JPEG buffer
+					const invalidBytes = new Uint8Array([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]);
+					const invalidResult = validateJpegSlide(invalidBytes, 3);
+					expect(invalidResult.valid).toBe(false);
+					expect(invalidResult.error).toContain("not a valid JPEG buffer");
+
+					// Oversized image (>8MB)
+					const oversized = new Uint8Array(MAX_INSTAGRAM_IMAGE_SIZE_BYTES + 10);
+					oversized[0] = 0xff;
+					oversized[1] = 0xd8;
+					oversized[2] = 0xff;
+					oversized[oversized.length - 2] = 0xff;
+					oversized[oversized.length - 1] = 0xd9;
+					const oversizedResult = validateJpegSlide(oversized, 4);
+					expect(oversizedResult.valid).toBe(false);
+					expect(oversizedResult.error).toContain("exceeds Meta maximum of 8MB");
+				});
+			});
+
+			describe("Meta Configuration, URL Building & Credentials Security", () => {
+				it("4. getValidatedInstagramConfig validates INSTAGRAM_AUTH_MODE and sets correct host", () => {
+					// Facebook login mode
+					const fbConfig = getValidatedInstagramConfig(mockInstagramDevEnv);
+					expect(fbConfig.authMode).toBe("facebook_login");
+					expect(fbConfig.apiBaseUrl).toBe(FACEBOOK_LOGIN_API_BASE_URL);
+					expect(fbConfig.apiBaseUrl).toBe("https://graph.facebook.com");
+					expect(fbConfig.accessToken).toBe("mock_test_instagram_token_xyz987");
+					expect(fbConfig.accountId).toBe("17841400000000000");
+					expect(fbConfig.graphVersion).toBe("v22.0");
+
+					// Instagram login mode
+					const igConfig = getValidatedInstagramConfig(mockInstagramDirectEnv);
+					expect(igConfig.authMode).toBe("instagram_login");
+					expect(igConfig.apiBaseUrl).toBe(INSTAGRAM_LOGIN_API_BASE_URL);
+					expect(igConfig.apiBaseUrl).toBe("https://graph.instagram.com");
+
+					// Missing auth mode
+					expect(() => getValidatedInstagramConfig({ ...mockInstagramDevEnv, INSTAGRAM_AUTH_MODE: "" })).toThrow(
+						"Missing required Worker setting: INSTAGRAM_AUTH_MODE"
+					);
+
+					// Invalid auth mode (strictly no guessing from token)
+					expect(() => getValidatedInstagramConfig({ ...mockInstagramDevEnv, INSTAGRAM_AUTH_MODE: "twitter_oauth" })).toThrow(
+						"Invalid INSTAGRAM_AUTH_MODE"
+					);
+
+					// Missing access token
+					expect(() => getValidatedInstagramConfig({ ...mockInstagramDevEnv, INSTAGRAM_ACCESS_TOKEN: "" })).toThrow(
+						"Missing required Worker secret: INSTAGRAM_ACCESS_TOKEN"
+					);
+
+					// Missing account ID
+					expect(() => getValidatedInstagramConfig({ ...mockInstagramDevEnv, INSTAGRAM_ACCOUNT_ID: "" })).toThrow(
+						"Missing required Worker secret: INSTAGRAM_ACCOUNT_ID"
+					);
+
+					// Default version fallback is v26.0
+					const envNoVersion: Env = { ...mockInstagramDevEnv, INSTAGRAM_GRAPH_VERSION: undefined };
+					const configDefault = getValidatedInstagramConfig(envNoVersion);
+					expect(configDefault.graphVersion).toBe("v26.0");
+					expect(configDefault.graphVersion).toBe(DEFAULT_INSTAGRAM_GRAPH_VERSION);
+				});
+
+				it("5. sanitizeMetaError completely redacts access tokens and signed URLs from error messages", () => {
+					const rawError = "Graph API failed with access_token=EAAG1234567890abcdef and token=secret_sig_url_abc";
+					const sanitized = sanitizeMetaError(rawError);
+					expect(sanitized).not.toContain("EAAG1234567890abcdef");
+					expect(sanitized).not.toContain("secret_sig_url_abc");
+					expect(sanitized).toContain("access_token=[REDACTED]");
+					expect(sanitized).toContain("token=[REDACTED]");
+
+					const bearerError = "Error with Authorization: Bearer mock_super_secret_token_123 in request";
+					const sanitizedBearer = sanitizeMetaError(bearerError);
+					expect(sanitizedBearer).not.toContain("mock_super_secret_token_123");
+					expect(sanitizedBearer).toContain("Bearer [REDACTED]");
+				});
+
+				it("6. buildGraphApiUrl formats Graph API URLs correctly with selected host", () => {
+					// Facebook Login host
+					expect(buildGraphApiUrl("v26.0", "17841400000000000/media", FACEBOOK_LOGIN_API_BASE_URL)).toBe(
+						"https://graph.facebook.com/v26.0/17841400000000000/media"
+					);
+
+					// Instagram Login host
+					expect(buildGraphApiUrl("v26.0", "17841400000000000/media", INSTAGRAM_LOGIN_API_BASE_URL)).toBe(
+						"https://graph.instagram.com/v26.0/17841400000000000/media"
+					);
+
+					// Version formatting with or without leading 'v'
+					expect(buildGraphApiUrl("26.0", "/media_publish", INSTAGRAM_LOGIN_API_BASE_URL)).toBe(
+						"https://graph.instagram.com/v26.0/media_publish"
+					);
+				});
+
+				it("7. verifyInstagramCredentials verifies Meta account connection using correct authentication host", async () => {
+					// Verify with facebook_login
+					const { calls: fbCalls } = setupMetaFetchMock();
+					const fbVerification = await verifyInstagramCredentials(mockInstagramDevEnv);
+					expect(fbVerification.valid).toBe(true);
+					expect(fbVerification.login_type).toBe("facebook_login");
+					expect(fbVerification.api_host).toBe("https://graph.facebook.com");
+					expect(fbCalls[0].url).toContain("https://graph.facebook.com/");
+
+					// Verify with instagram_login
+					const { calls: igCalls } = setupMetaFetchMock();
+					const igVerification = await verifyInstagramCredentials(mockInstagramDirectEnv);
+					expect(igVerification.valid).toBe(true);
+					expect(igVerification.login_type).toBe("instagram_login");
+					expect(igVerification.api_host).toBe("https://graph.instagram.com");
+					expect(igCalls[0].url).toContain("https://graph.instagram.com/");
+
+					// Test 401 error safely handled
+					setupMetaFetchMock({ shouldFailAuth: true });
+					const failedVerification = await verifyInstagramCredentials(mockInstagramDevEnv);
+					expect(failedVerification.valid).toBe(false);
+					expect(failedVerification.error).toContain("Meta Graph API authentication failed (401)");
+					expect(failedVerification.error).not.toContain("mock_test_instagram_token");
+				});
+			});
+
+			describe("Post Eligibility & State Invariants", () => {
+				it("8. validatePostForPublishing accepts valid approved post with 4-6 slides", () => {
+					const validPost = {
+						id: "17000000-0000-0000-0000-000000001700",
+						post_status: "approved",
+						human_review_required: true,
+						carousel_slide_count: 5,
+						instagram_caption: "Valid legal caption",
+					};
+					const result = validatePostForPublishing(validPost);
+					expect(result.valid).toBe(true);
+				});
+
+				it("9. validatePostForPublishing rejects non-approved post statuses", () => {
+					const pendingPost = { post_status: "pending_approval", human_review_required: true, carousel_slide_count: 5, instagram_caption: "Caption" };
+					expect(validatePostForPublishing(pendingPost).error_code).toBe("POST_NOT_APPROVED");
+
+					const rejectedPost = { post_status: "rejected", human_review_required: true, carousel_slide_count: 5, instagram_caption: "Caption" };
+					expect(validatePostForPublishing(rejectedPost).error_code).toBe("POST_NOT_APPROVED");
+
+					const storedPost = { post_status: "stored", human_review_required: true, carousel_slide_count: 5, instagram_caption: "Caption" };
+					expect(validatePostForPublishing(storedPost).error_code).toBe("POST_NOT_APPROVED");
+				});
+
+				it("10. validatePostForPublishing strictly prohibits republishing already published posts", () => {
+					const publishedPost = { post_status: "published", human_review_required: true, carousel_slide_count: 5, instagram_caption: "Caption" };
+					const result = validatePostForPublishing(publishedPost);
+					expect(result.valid).toBe(false);
+					expect(result.error_code).toBe("POST_ALREADY_PUBLISHED");
+				});
+
+				it("11. validatePostForPublishing rejects currently publishing posts to prevent race conditions", () => {
+					const publishingPost = { post_status: "publishing", human_review_required: true, carousel_slide_count: 5, instagram_caption: "Caption" };
+					const result = validatePostForPublishing(publishingPost);
+					expect(result.valid).toBe(false);
+					expect(result.error_code).toBe("PUBLISHING_IN_PROGRESS");
+				});
+
+				it("12. validatePostForPublishing rejects invalid slide counts (<4 or >6) and empty captions", () => {
+					const lowSlides = { post_status: "approved", human_review_required: true, carousel_slide_count: 3, instagram_caption: "Caption" };
+					expect(validatePostForPublishing(lowSlides).error_code).toBe("INVALID_SLIDE_COUNT");
+
+					const highSlides = { post_status: "approved", human_review_required: true, carousel_slide_count: 7, instagram_caption: "Caption" };
+					expect(validatePostForPublishing(highSlides).error_code).toBe("INVALID_SLIDE_COUNT");
+
+					const emptyCaption = { post_status: "approved", human_review_required: true, carousel_slide_count: 5, instagram_caption: "   " };
+					expect(validatePostForPublishing(emptyCaption).error_code).toBe("EMPTY_CAPTION");
+				});
+			});
+
+			describe("JPEG Conversion & Asset Preparation", () => {
+				it("13. convertSlidePngsToJpegs converts slides with customConverter preserving order and numbering", async () => {
+					const testSlides = [
+						{ slide_number: 1, bytes: new Uint8Array([1, 2, 3]), filename: "slide-01.png" },
+						{ slide_number: 2, bytes: new Uint8Array([4, 5, 6]), filename: "slide-02.png" },
+					];
+
+					const converted = await convertSlidePngsToJpegs(testSlides, mockInstagramDevEnv, {
+						customConverter: async (_bytes, _num) => createSyntheticJpegBuffer(1080, 1350),
+					});
+
+					expect(converted).toHaveLength(2);
+					expect(converted[0].slide_number).toBe(1);
+					expect(converted[0].filename).toBe("slide-01.jpg");
+					expect(converted[0].mime_type).toBe("image/jpeg");
+					expect(converted[0].width).toBe(1080);
+					expect(converted[0].height).toBe(1350);
+					expect(converted[1].slide_number).toBe(2);
+					expect(converted[1].filename).toBe("slide-02.jpg");
+				});
+
+				it("14. preparePublishingAssets retrieves slides, converts to JPEG, uploads to storage, and generates 60-minute signed URLs accessible over HTTPS without auth headers", async () => {
+					const mockSupabase = createMockPublishingSupabase();
+					vi.spyOn(supabaseModule, "getSupabaseClient").mockReturnValue(mockSupabase.mockClient as any);
+
+					const prepResult = await preparePublishingAssets(mockInstagramDevEnv, "17000000-0000-0000-0000-000000001700", {
+						customConverter: async () => createSyntheticJpegBuffer(1080, 1350),
+					});
+
+					expect(prepResult.slides).toHaveLength(5);
+					expect(prepResult.slides[0].slide_number).toBe(1);
+					expect(prepResult.slides[0].storage_path).toContain("publishing/slide-01.jpg");
+					expect(prepResult.slides[0].signed_url).toContain("token=mock_secret_signed_token");
+
+					// Verify 60 minute (3600 second) TTL was passed
+					expect(mockSupabase.getCapturedSignedUrlExpiry()).toBe(3600);
+					expect(SIGNED_URL_PUBLISH_EXPIRY_SECONDS).toBe(3600);
+
+					// Verify signed URL is a standalone HTTPS URL with query token (accessible without Authorization header)
+					const signedUrl = new URL(prepResult.slides[0].signed_url);
+					expect(signedUrl.protocol).toBe("https:");
+					expect(signedUrl.searchParams.has("token")).toBe(true);
+
+					expect(prepResult.caption).toContain("GST Council");
+					expect(mockSupabase.uploadedFiles.size).toBe(5);
+				});
+			});
+
+			describe("Meta Graph API Container Operations", () => {
+				const fbConfig: InstagramPublishingConfig = {
+					accessToken: "mock_test_instagram_token_xyz987",
+					accountId: "17841400000000000",
+					graphVersion: "v26.0",
+					authMode: "facebook_login",
+					apiBaseUrl: FACEBOOK_LOGIN_API_BASE_URL,
+				};
+
+				const igConfig: InstagramPublishingConfig = {
+					accessToken: "mock_test_instagram_token_xyz987",
+					accountId: "17841400000000000",
+					graphVersion: "v26.0",
+					authMode: "instagram_login",
+					apiBaseUrl: INSTAGRAM_LOGIN_API_BASE_URL,
+				};
+
+				it("15. createCarouselItemContainer creates child item container with is_carousel_item=true using configured host", async () => {
+					// Test facebook_login host
+					const { calls: fbCalls } = setupMetaFetchMock();
+					const fbContainerId = await createCarouselItemContainer(fbConfig, "https://storage.test/slide-01.jpg");
+					expect(fbContainerId).toContain("child_container_");
+					expect(fbCalls[0].url).toContain("https://graph.facebook.com/v26.0/17841400000000000/media");
+					expect(fbCalls[0].body.image_url).toBe("https://storage.test/slide-01.jpg");
+					expect(fbCalls[0].body.is_carousel_item).toBe(true);
+					expect(fbCalls[0].headers.Authorization).toBe("Bearer mock_test_instagram_token_xyz987");
+
+					// Test instagram_login host
+					const { calls: igCalls } = setupMetaFetchMock();
+					const igContainerId = await createCarouselItemContainer(igConfig, "https://storage.test/slide-01.jpg");
+					expect(igContainerId).toContain("child_container_");
+					expect(igCalls[0].url).toContain("https://graph.instagram.com/v26.0/17841400000000000/media");
+				});
+
+				it("16. createCarouselContainer creates parent carousel container using configured host", async () => {
+					const { calls: fbCalls } = setupMetaFetchMock();
+					const children = ["child_1", "child_2", "child_3", "child_4", "child_5"];
+					const parentId = await createCarouselContainer(fbConfig, children, "LawBriefly Legal Update #TaxLaw");
+					expect(parentId).toBe("parent_carousel_container_999");
+					expect(fbCalls[0].url).toContain("https://graph.facebook.com/v26.0/17841400000000000/media");
+					expect(fbCalls[0].body.media_type).toBe("CAROUSEL");
+					expect(fbCalls[0].body.children).toEqual(children);
+					expect(fbCalls[0].body.caption).toBe("LawBriefly Legal Update #TaxLaw");
+
+					// Verify with instagram_login host
+					const { calls: igCalls } = setupMetaFetchMock();
+					await createCarouselContainer(igConfig, children, "Caption");
+					expect(igCalls[0].url).toContain("https://graph.instagram.com/v26.0/17841400000000000/media");
+				});
+
+				it("17. getContainerStatus and pollContainerUntilReady poll status using configured host", async () => {
+					const { calls } = setupMetaFetchMock({
+						customStatusSequence: ["IN_PROGRESS", "IN_PROGRESS", "FINISHED"],
+					});
+
+					const result = await pollContainerUntilReady(igConfig, "parent_carousel_container_999", {
+						maxAttempts: 5,
+						intervalMs: 10,
+					});
+
+					expect(result.status_code).toBe("FINISHED");
+					expect(calls[0].url).toContain("https://graph.instagram.com/v26.0/parent_carousel_container_999?fields=status_code,status");
+				});
+
+				it("18. pollContainerUntilReady throws descriptive error on container ERROR or EXPIRED status", async () => {
+					setupMetaFetchMock({ statusResult: "ERROR" });
+					await expect(
+						pollContainerUntilReady(fbConfig, "parent_carousel_container_999", { maxAttempts: 2, intervalMs: 10 })
+					).rejects.toThrow("Container processing failed on Meta side (status_code: ERROR)");
+
+					setupMetaFetchMock({ statusResult: "EXPIRED" });
+					await expect(
+						pollContainerUntilReady(fbConfig, "parent_carousel_container_999", { maxAttempts: 2, intervalMs: 10 })
+					).rejects.toThrow("Container expired on Meta side");
+				});
+
+				it("19. publishMediaContainer and getPublishedMediaDetails call correct endpoints on configured host", async () => {
+					const { calls } = setupMetaFetchMock();
+					const mediaId = await publishMediaContainer(igConfig, "parent_carousel_container_999");
+					expect(mediaId).toBe("17999999999999999");
+					expect(calls[0].url).toContain("https://graph.instagram.com/v26.0/17841400000000000/media_publish");
+
+					const details = await getPublishedMediaDetails(igConfig, mediaId);
+					expect(details.id).toBe("17999999999999999");
+					expect(details.permalink).toContain("instagram.com/p/");
+					expect(details.media_type).toBe("CAROUSEL_ALBUM");
+					expect(calls[1].url).toContain("https://graph.instagram.com/v26.0/17999999999999999?fields=id,permalink,media_type,timestamp");
+				});
+			});
+
+			describe("Prepare-Only Safety Invariants (Dry-Run Mode)", () => {
+				it("20. publishApprovedCarousel in prepare_only mode creates containers, verifies status, and NEVER calls media_publish", async () => {
+					const mockSupabase = createMockPublishingSupabase();
+					vi.spyOn(supabaseModule, "getSupabaseClient").mockReturnValue(mockSupabase.mockClient as any);
+					const { calls } = setupMetaFetchMock();
+
+					const result = await publishApprovedCarousel(mockInstagramDevEnv, "17000000-0000-0000-0000-000000001700", {
+						prepareOnly: true,
+						customConverter: async () => createSyntheticJpegBuffer(1080, 1350),
+						pollIntervalMs: 5,
+					});
+
+					expect(result.success).toBe(true);
+					expect(result.prepare_only).toBe(true);
+					expect(result.dry_run).toBe(true);
+					expect(result.carousel_container_id).toBe("parent_carousel_container_999");
+					expect(result.child_container_ids).toHaveLength(5);
+
+					// Critical invariant: media_publish must NEVER be called in prepare-only mode
+					const publishCall = calls.find((c) => c.url.endsWith("/media_publish"));
+					expect(publishCall).toBeUndefined();
+
+					// Critical invariant: existing approved post must remain 'approved' in database
+					expect(mockSupabase.getPost().post_status).toBe("approved");
+				});
+
+				it("21. publishApprovedCarousel defaults to prepareOnly=true when no option is provided", async () => {
+					const mockSupabase = createMockPublishingSupabase();
+					vi.spyOn(supabaseModule, "getSupabaseClient").mockReturnValue(mockSupabase.mockClient as any);
+					const { calls } = setupMetaFetchMock();
+
+					const result = await publishApprovedCarousel(mockInstagramDevEnv, "17000000-0000-0000-0000-000000001700", {
+						customConverter: async () => createSyntheticJpegBuffer(1080, 1350),
+						pollIntervalMs: 5,
+					});
+
+					expect(result.success).toBe(true);
+					expect(result.prepare_only).toBe(true);
+
+					// Zero calls to media_publish
+					expect(calls.some((c) => c.url.endsWith("/media_publish"))).toBe(false);
+					expect(mockSupabase.getPost().post_status).toBe("approved");
+				});
+			});
+
+			describe("API Route: POST /api/ai/publish-instagram", () => {
+				it("22. returns 404 in production environment (strictly development-only)", async () => {
+					const req = new Request("http://localhost/api/ai/publish-instagram", {
+						method: "POST",
+						headers: { "Content-Type": "application/json" },
+						body: JSON.stringify({ post_id: "17000000-0000-0000-0000-000000001700" }),
+					});
+
+					const ctx = createExecutionContext();
+					const response = await worker.fetch(req, mockInstagramProdEnv, ctx);
+					await waitOnExecutionContext(ctx);
+
+					expect(response.status).toBe(404);
+				});
+
+				it("23. returns 405 on non-POST HTTP methods", async () => {
+					const req = new Request("http://localhost/api/ai/publish-instagram", { method: "GET" });
+					const response = await handlePublishInstagram(req, mockInstagramDevEnv);
+					expect(response.status).toBe(405);
+				});
+
+				it("24. returns 400 on malformed payloads or missing post_id", async () => {
+					const reqNonJson = new Request("http://localhost/api/ai/publish-instagram", {
+						method: "POST",
+						headers: { "Content-Type": "text/plain" },
+						body: "not-json",
+					});
+					const res1 = await handlePublishInstagram(reqNonJson, mockInstagramDevEnv);
+					expect(res1.status).toBe(400);
+
+					const reqBadId = new Request("http://localhost/api/ai/publish-instagram", {
+						method: "POST",
+						headers: { "Content-Type": "application/json" },
+						body: JSON.stringify({ post_id: "invalid-uuid" }),
+					});
+					const res2 = await handlePublishInstagram(reqBadId, mockInstagramDevEnv);
+					expect(res2.status).toBe(400);
+				});
+
+				it("25. successfully processes prepare-only publishing via worker.fetch in development mode", async () => {
+					const mockSupabase = createMockPublishingSupabase();
+					vi.spyOn(supabaseModule, "getSupabaseClient").mockReturnValue(mockSupabase.mockClient as any);
+					const { calls } = setupMetaFetchMock();
+
+					// Mock Puppeteer browser launch for real endpoint execution
+					const mockScreenshot = vi.fn().mockResolvedValue(createSyntheticJpegBuffer(1080, 1350));
+					const mockPage = {
+						setViewport: vi.fn().mockResolvedValue(undefined),
+						setContent: vi.fn().mockResolvedValue(undefined),
+						screenshot: mockScreenshot,
+					};
+					vi.spyOn(puppeteer, "launch").mockResolvedValue({
+						newPage: vi.fn().mockResolvedValue(mockPage),
+						close: vi.fn().mockResolvedValue(undefined),
+					} as any);
+
+					const req = new Request("http://localhost/api/ai/publish-instagram", {
+						method: "POST",
+						headers: { "Content-Type": "application/json" },
+						body: JSON.stringify({
+							post_id: "17000000-0000-0000-0000-000000001700",
+							prepare_only: true,
+						}),
+					});
+
+					const ctx = createExecutionContext();
+					const response = await worker.fetch(req, mockInstagramDevEnv, ctx);
+					await waitOnExecutionContext(ctx);
+
+					expect(response.status).toBe(200);
+					const data = (await response.json()) as any;
+					expect(data.success).toBe(true);
+					expect(data.prepare_only).toBe(true);
+					expect(data.dry_run).toBe(true);
+					expect(data.carousel_container_id).toBe("parent_carousel_container_999");
+					expect(data.child_container_ids).toHaveLength(5);
+
+					// Never calls media_publish
+					expect(calls.some((c) => c.url.endsWith("/media_publish"))).toBe(false);
+					expect(mockSupabase.getPost().post_status).toBe("approved");
 				});
 			});
 		});
