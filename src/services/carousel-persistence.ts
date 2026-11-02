@@ -20,11 +20,12 @@ import type {
 export const CAROUSEL_STORAGE_BUCKET = "lawbriefly-carousel-assets";
 export const SIGNED_URL_DEFAULT_EXPIRY_SECONDS = 900; // 15 minutes
 export const RENDERER_VERSION = "v2";
+export const SUPABASE_STORAGE_MAX_FILE_SIZE_BYTES = 5 * 1024 * 1024; // 5 MB
 
 export interface PersistedAssetMetadata {
 	id?: string;
 	post_id: string;
-	asset_type: "slide" | "manifest";
+	asset_type: "slide" | "manifest" | "publishing_slide";
 	asset_key: string;
 	slide_number: number | null;
 	storage_bucket: string;
@@ -112,6 +113,46 @@ export function isValidPngBuffer(bytes: Uint8Array): boolean {
 }
 
 /**
+ * Validates a JPEG file's standard magic bytes (FF D8 ... FF D9).
+ */
+export function isValidJpegBuffer(bytes: Uint8Array): boolean {
+	if (!bytes || bytes.length < 4) return false;
+	return bytes[0] === 0xff && bytes[1] === 0xd8 && bytes[bytes.length - 2] === 0xff && bytes[bytes.length - 1] === 0xd9;
+}
+
+/**
+ * Extracts dimensions from JPEG SOF markers.
+ */
+export function getJpegDimensions(bytes: Uint8Array): { width: number; height: number } | null {
+	if (!isValidJpegBuffer(bytes)) return null;
+
+	let offset = 2;
+	while (offset < bytes.length - 1) {
+		if (bytes[offset] !== 0xff) {
+			offset++;
+			continue;
+		}
+
+		const marker = bytes[offset + 1];
+
+		// SOF0 (0xC0), SOF1 (0xC1), SOF2 (0xC2)
+		if (marker === 0xc0 || marker === 0xc1 || marker === 0xc2) {
+			if (offset + 8 >= bytes.length) return null;
+			const height = (bytes[offset + 5] << 8) | bytes[offset + 6];
+			const width = (bytes[offset + 7] << 8) | bytes[offset + 8];
+			return { width, height };
+		}
+
+		// Skip variable length marker
+		if (offset + 3 >= bytes.length) break;
+		const length = (bytes[offset + 2] << 8) | bytes[offset + 3];
+		offset += 2 + length;
+	}
+
+	return null;
+}
+
+/**
  * Validates input parameters for carousel persistence.
  * Enforces evidence requirements, slide counts (4-6), slide order, image dimensions, and PNG signatures.
  */
@@ -184,11 +225,43 @@ export function validatePersistenceInput(
 			};
 		}
 
+		if (slide.bytes.length > SUPABASE_STORAGE_MAX_FILE_SIZE_BYTES) {
+			return {
+				valid: false,
+				error: `Slide ${slide.slide_number} PNG size (${slide.bytes.length} bytes) exceeds Supabase storage limit of 5 MB.`,
+			};
+		}
+
 		if (!isValidPngBuffer(slide.bytes)) {
 			return {
 				valid: false,
 				error: `Slide ${slide.slide_number} does not contain a valid PNG signature.`,
 			};
+		}
+
+		// Validate dual-format JPEG if present
+		if (slide.jpeg_bytes) {
+			if (slide.jpeg_bytes.length > SUPABASE_STORAGE_MAX_FILE_SIZE_BYTES) {
+				return {
+					valid: false,
+					error: `Slide ${slide.slide_number} JPEG size (${slide.jpeg_bytes.length} bytes) exceeds Supabase storage limit of 5 MB.`,
+				};
+			}
+
+			if (!isValidJpegBuffer(slide.jpeg_bytes)) {
+				return {
+					valid: false,
+					error: `Slide ${slide.slide_number} does not contain a valid JPEG signature.`,
+				};
+			}
+
+			const jpegDims = getJpegDimensions(slide.jpeg_bytes);
+			if (!jpegDims || jpegDims.width !== 1080 || jpegDims.height !== 1350) {
+				return {
+					valid: false,
+					error: `Slide ${slide.slide_number} JPEG has invalid dimensions: ${jpegDims?.width}x${jpegDims?.height} (expected 1080x1350).`,
+				};
+			}
 		}
 	}
 
@@ -337,23 +410,40 @@ export async function persistRenderedCarousel(
 	const newlyUploadedPaths: string[] = [];
 
 	try {
-		// Upload slides sequentially
+		// Upload slides sequentially (both PNG and pre-generated JPEG)
 		for (const slide of renderedArtifact.slides) {
 			const slidePadded = String(slide.slide_number).padStart(2, "0");
-			const storagePath = `posts/${postId}/slide-${slidePadded}.png`;
+			const pngStoragePath = `posts/${postId}/slide-${slidePadded}.png`;
 
 			const { error: uploadError } = await supabase.storage
 				.from(CAROUSEL_STORAGE_BUCKET)
-				.upload(storagePath, slide.bytes, {
+				.upload(pngStoragePath, slide.bytes, {
 					contentType: "image/png",
 					upsert: true,
 				});
 
 			if (uploadError) {
-				throw new Error(`Failed to upload slide ${slide.slide_number} to storage: ${uploadError.message}`);
+				throw new Error(`Failed to upload slide ${slide.slide_number} PNG to storage: ${uploadError.message}`);
 			}
 
-			newlyUploadedPaths.push(storagePath);
+			newlyUploadedPaths.push(pngStoragePath);
+
+			// Upload pre-generated JPEG if present
+			if (slide.jpeg_bytes) {
+				const jpegStoragePath = `posts/${postId}/publishing/slide-${slidePadded}.jpg`;
+				const { error: jpegUploadError } = await supabase.storage
+					.from(CAROUSEL_STORAGE_BUCKET)
+					.upload(jpegStoragePath, slide.jpeg_bytes, {
+						contentType: "image/jpeg",
+						upsert: true,
+					});
+
+				if (jpegUploadError) {
+					throw new Error(`Failed to upload slide ${slide.slide_number} JPEG to storage: ${jpegUploadError.message}`);
+				}
+
+				newlyUploadedPaths.push(jpegStoragePath);
+			}
 		}
 
 		// Upload manifest.json
@@ -376,7 +466,7 @@ export async function persistRenderedCarousel(
 
 		for (const slide of renderedArtifact.slides) {
 			const slidePadded = String(slide.slide_number).padStart(2, "0");
-			const storagePath = `posts/${postId}/slide-${slidePadded}.png`;
+			const pngStoragePath = `posts/${postId}/slide-${slidePadded}.png`;
 			const checksum = await calculateSha256(slide.bytes);
 
 			assetRows.push({
@@ -385,13 +475,33 @@ export async function persistRenderedCarousel(
 				asset_key: `slide-${slidePadded}`,
 				slide_number: slide.slide_number,
 				storage_bucket: CAROUSEL_STORAGE_BUCKET,
-				storage_path: storagePath,
+				storage_path: pngStoragePath,
 				mime_type: "image/png",
 				width: slide.width,
 				height: slide.height,
 				size_bytes: slide.bytes.length,
 				sha256: checksum,
 			});
+
+			// Insert publishing_slide record for JPEG
+			if (slide.jpeg_bytes) {
+				const jpegStoragePath = `posts/${postId}/publishing/slide-${slidePadded}.jpg`;
+				const jpegChecksum = await calculateSha256(slide.jpeg_bytes);
+
+				assetRows.push({
+					post_id: postId,
+					asset_type: "publishing_slide",
+					asset_key: `slide-${slidePadded}-jpeg`,
+					slide_number: slide.slide_number,
+					storage_bucket: CAROUSEL_STORAGE_BUCKET,
+					storage_path: jpegStoragePath,
+					mime_type: "image/jpeg",
+					width: slide.width,
+					height: slide.height,
+					size_bytes: slide.jpeg_bytes.length,
+					sha256: jpegChecksum,
+				});
+			}
 		}
 
 		const manifestChecksum = await calculateSha256(renderedArtifact.manifestBytes);

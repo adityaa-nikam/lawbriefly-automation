@@ -610,80 +610,118 @@ export async function preparePublishingAssets(
 		throw new Error(validation.error);
 	}
 
-	// 2. Fetch slide assets
-	const { data: assets, error: assetsError } = await supabase
+	// 2. Fetch slide assets for this post
+	const { data: allAssets, error: assetsError } = await supabase
 		.from("social_content_assets")
 		.select("*")
 		.eq("post_id", postId)
-		.eq("asset_type", "slide")
 		.order("slide_number", { ascending: true });
 
-	if (assetsError || !assets || assets.length === 0) {
+	if (assetsError || !allAssets || allAssets.length === 0) {
 		throw new Error(`No slide assets found for post ${postId}`);
 	}
 
-	if (assets.length !== post.carousel_slide_count) {
-		throw new Error(
-			`Slide count mismatch: post requires ${post.carousel_slide_count} slides, found ${assets.length}.`
-		);
-	}
+	const publishingJpegAssets = allAssets.filter(
+		(a) => a.asset_type === "publishing_slide" && a.slide_number !== null
+	);
+	const pngSlideAssets = allAssets.filter(
+		(a) => a.asset_type === "slide" && a.slide_number !== null
+	);
 
-	// 3. Download slide PNGs from Supabase Storage
-	const downloadedSlides: Array<{ slide_number: number; bytes: Uint8Array; filename: string }> = [];
-	for (const asset of assets) {
-		const { data: blob, error: downloadError } = await supabase.storage
-			.from(asset.storage_bucket || CAROUSEL_STORAGE_BUCKET)
-			.download(asset.storage_path);
+	const requiredCount = post.carousel_slide_count;
 
-		if (downloadError || !blob) {
-			throw new Error(`Failed to download slide ${asset.slide_number} from storage: ${downloadError?.message}`);
-		}
+	// Check if a complete set of pre-generated publishing_slide JPEGs exists
+	const hasCompleteJpegSet =
+		publishingJpegAssets.length === requiredCount &&
+		publishingJpegAssets.every((a, idx) => a.slide_number === idx + 1);
 
-		const bytes = new Uint8Array(await blob.arrayBuffer());
-		downloadedSlides.push({
-			slide_number: asset.slide_number,
-			bytes,
-			filename: asset.asset_key,
-		});
-	}
-
-	// 4. Convert PNGs to JPEGs
-	const jpegArtifacts = await convertSlidePngsToJpegs(downloadedSlides, env, {
-		customConverter: options?.customConverter,
-	});
-
-	// 5. Upload JPEGs to storage under posts/${postId}/publishing/
 	const preparedSlides: PreparePublishingAssetsResult["slides"] = [];
-	for (const jpeg of jpegArtifacts) {
-		const storagePath = `posts/${postId}/publishing/${jpeg.filename}`;
 
-		const { error: uploadError } = await supabase.storage
-			.from(CAROUSEL_STORAGE_BUCKET)
-			.upload(storagePath, jpeg.bytes, {
-				contentType: "image/jpeg",
-				upsert: true,
+	if (hasCompleteJpegSet) {
+		// FAST PATH: Direct signed URL generation from pre-generated publishing_slide JPEG assets.
+		// Bypasses PNG downloading, browser conversion, and JPEG re-uploading.
+		for (const asset of publishingJpegAssets) {
+			const { data: signedData, error: signError } = await supabase.storage
+				.from(asset.storage_bucket || CAROUSEL_STORAGE_BUCKET)
+				.createSignedUrl(asset.storage_path, signedExpiry);
+
+			if (signError || !signedData?.signedUrl) {
+				throw new Error(`Failed to generate signed URL for ${asset.storage_path}: ${signError?.message}`);
+			}
+
+			preparedSlides.push({
+				slide_number: asset.slide_number!,
+				storage_path: asset.storage_path,
+				signed_url: signedData.signedUrl,
+				size_bytes: asset.size_bytes,
+				sha256: asset.sha256,
 			});
-
-		if (uploadError) {
-			throw new Error(`Failed to upload JPEG publishing asset ${storagePath}: ${uploadError.message}`);
+		}
+	} else {
+		// FALLBACK PATH: For legacy posts or when publishing_slide assets are missing.
+		// Validate that a complete set of PNG slide assets exists. Never publish an incomplete carousel.
+		if (pngSlideAssets.length !== requiredCount) {
+			throw new Error(
+				`Incomplete carousel assets: post requires ${requiredCount} slides, but found ${publishingJpegAssets.length} JPEG(s) and ${pngSlideAssets.length} PNG(s). Never publish an incomplete carousel.`
+			);
 		}
 
-		// Generate temporary signed URL (never saved to database!)
-		const { data: signedData, error: signError } = await supabase.storage
-			.from(CAROUSEL_STORAGE_BUCKET)
-			.createSignedUrl(storagePath, signedExpiry);
+		// Download slide PNGs from Supabase Storage
+		const downloadedSlides: Array<{ slide_number: number; bytes: Uint8Array; filename: string }> = [];
+		for (const asset of pngSlideAssets) {
+			const { data: blob, error: downloadError } = await supabase.storage
+				.from(asset.storage_bucket || CAROUSEL_STORAGE_BUCKET)
+				.download(asset.storage_path);
 
-		if (signError || !signedData?.signedUrl) {
-			throw new Error(`Failed to generate signed URL for ${storagePath}: ${signError?.message}`);
+			if (downloadError || !blob) {
+				throw new Error(`Failed to download slide ${asset.slide_number} from storage: ${downloadError?.message}`);
+			}
+
+			const bytes = new Uint8Array(await blob.arrayBuffer());
+			downloadedSlides.push({
+				slide_number: asset.slide_number,
+				bytes,
+				filename: asset.asset_key,
+			});
 		}
 
-		preparedSlides.push({
-			slide_number: jpeg.slide_number,
-			storage_path: storagePath,
-			signed_url: signedData.signedUrl,
-			size_bytes: jpeg.size_bytes,
-			sha256: jpeg.sha256,
+		// Convert PNGs to JPEGs
+		const jpegArtifacts = await convertSlidePngsToJpegs(downloadedSlides, env, {
+			customConverter: options?.customConverter,
 		});
+
+		// Upload JPEGs to storage under posts/${postId}/publishing/
+		for (const jpeg of jpegArtifacts) {
+			const storagePath = `posts/${postId}/publishing/${jpeg.filename}`;
+
+			const { error: uploadError } = await supabase.storage
+				.from(CAROUSEL_STORAGE_BUCKET)
+				.upload(storagePath, jpeg.bytes, {
+					contentType: "image/jpeg",
+					upsert: true,
+				});
+
+			if (uploadError) {
+				throw new Error(`Failed to upload JPEG publishing asset ${storagePath}: ${uploadError.message}`);
+			}
+
+			// Generate temporary signed URL (never saved to database!)
+			const { data: signedData, error: signError } = await supabase.storage
+				.from(CAROUSEL_STORAGE_BUCKET)
+				.createSignedUrl(storagePath, signedExpiry);
+
+			if (signError || !signedData?.signedUrl) {
+				throw new Error(`Failed to generate signed URL for ${storagePath}: ${signError?.message}`);
+			}
+
+			preparedSlides.push({
+				slide_number: jpeg.slide_number,
+				storage_path: storagePath,
+				signed_url: signedData.signedUrl,
+				size_bytes: jpeg.size_bytes,
+				sha256: jpeg.sha256,
+			});
+		}
 	}
 
 	return {
@@ -1150,60 +1188,75 @@ export async function publishSingleImage(
 			};
 		}
 
-		// Retrieve primary slide asset (slide 1)
-		const { data: assets, error: assetError } = await supabase
+		// Check if a pre-generated publishing_slide JPEG exists for slide 1
+		const { data: pubSlideAssets } = await supabase
 			.from("social_content_assets")
 			.select("*")
 			.eq("post_id", params.postId)
-			.eq("asset_type", "slide")
+			.eq("asset_type", "publishing_slide")
 			.order("slide_number", { ascending: true });
 
-		if (assetError || !assets || assets.length === 0) {
-			throw new Error(`No slide asset found for post ${params.postId}`);
-		}
+		const pregeneratedJpeg = pubSlideAssets && pubSlideAssets.length > 0 ? pubSlideAssets[0] : null;
 
-		const primaryAsset = assets[0];
-
-		// Download asset from Supabase Storage
-		const { data: blob, error: downloadError } = await supabase.storage
-			.from(primaryAsset.storage_bucket || CAROUSEL_STORAGE_BUCKET)
-			.download(primaryAsset.storage_path);
-
-		if (downloadError || !blob) {
-			throw new Error(`Failed to download slide from storage: ${downloadError?.message}`);
-		}
-
-		const rawBytes = new Uint8Array(await blob.arrayBuffer());
-
-		// Check if already JPEG or convert from PNG
-		let jpegBytes: Uint8Array;
-		if (isValidJpegBuffer(rawBytes)) {
-			jpegBytes = rawBytes;
-		} else if (params.options?.customConverter) {
-			jpegBytes = await params.options.customConverter(rawBytes, 1);
+		if (pregeneratedJpeg) {
+			// FAST PATH: Use existing pre-generated JPEG asset directly
+			storagePath = pregeneratedJpeg.storage_path;
 		} else {
-			jpegBytes = await convertPngToJpegWithBrowser(rawBytes, env);
+			// FALLBACK PATH: Retrieve primary slide asset (slide 1 PNG) and convert
+			const { data: assets, error: assetError } = await supabase
+				.from("social_content_assets")
+				.select("*")
+				.eq("post_id", params.postId)
+				.eq("asset_type", "slide")
+				.order("slide_number", { ascending: true });
+
+			if (assetError || !assets || assets.length === 0) {
+				throw new Error(`No slide asset found for post ${params.postId}`);
+			}
+
+			const primaryAsset = assets[0];
+
+			// Download asset from Supabase Storage
+			const { data: blob, error: downloadError } = await supabase.storage
+				.from(primaryAsset.storage_bucket || CAROUSEL_STORAGE_BUCKET)
+				.download(primaryAsset.storage_path);
+
+			if (downloadError || !blob) {
+				throw new Error(`Failed to download slide from storage: ${downloadError?.message}`);
+			}
+
+			const rawBytes = new Uint8Array(await blob.arrayBuffer());
+
+			// Check if already JPEG or convert from PNG
+			let jpegBytes: Uint8Array;
+			if (isValidJpegBuffer(rawBytes)) {
+				jpegBytes = rawBytes;
+			} else if (params.options?.customConverter) {
+				jpegBytes = await params.options.customConverter(rawBytes, 1);
+			} else {
+				jpegBytes = await convertPngToJpegWithBrowser(rawBytes, env);
+			}
+
+			const validation = validateJpegSlide(jpegBytes, 1);
+			if (!validation.valid) {
+				throw new Error(`JPEG validation failed: ${validation.error}`);
+			}
+
+			// Upload JPEG publishing asset
+			const jpegPath = `posts/${params.postId}/publishing/single-image.jpg`;
+			const { error: uploadError } = await supabase.storage
+				.from(CAROUSEL_STORAGE_BUCKET)
+				.upload(jpegPath, jpegBytes, {
+					contentType: "image/jpeg",
+					upsert: true,
+				});
+
+			if (uploadError) {
+				throw new Error(`Failed to upload JPEG publishing asset: ${uploadError.message}`);
+			}
+
+			storagePath = jpegPath;
 		}
-
-		const validation = validateJpegSlide(jpegBytes, 1);
-		if (!validation.valid) {
-			throw new Error(`JPEG validation failed: ${validation.error}`);
-		}
-
-		// Upload JPEG publishing asset
-		const jpegPath = `posts/${params.postId}/publishing/single-image.jpg`;
-		const { error: uploadError } = await supabase.storage
-			.from(CAROUSEL_STORAGE_BUCKET)
-			.upload(jpegPath, jpegBytes, {
-				contentType: "image/jpeg",
-				upsert: true,
-			});
-
-		if (uploadError) {
-			throw new Error(`Failed to upload JPEG publishing asset: ${uploadError.message}`);
-		}
-
-		storagePath = jpegPath;
 
 		// Format caption with hashtags
 		const hashtags = Array.isArray(post.hashtags) ? post.hashtags : [];

@@ -29,6 +29,7 @@ export interface RenderManifestSlide {
 	slide_number: number;
 	slide_role: string;
 	filename: string;
+	jpeg_filename?: string;
 	dimensions: {
 		width: number;
 		height: number;
@@ -238,12 +239,21 @@ export function generateSlideHtml(
 }
 
 /**
- * Formats slide filename for standard packaging
+ * Formats slide filename for standard packaging (PNG)
  */
 export function getSlideFilename(slideNumber: number, role: string): string {
 	const padded = String(slideNumber).padStart(2, "0");
 	const slug = role.replace(/_/g, "-");
 	return `slide-${padded}-${slug}.png`;
+}
+
+/**
+ * Formats slide filename for Instagram publishing asset (JPEG)
+ */
+export function getSlideJpegFilename(slideNumber: number, role: string): string {
+	const padded = String(slideNumber).padStart(2, "0");
+	const slug = role.replace(/_/g, "-");
+	return `slide-${padded}-${slug}.jpg`;
 }
 
 export interface RenderedSlideArtifact {
@@ -252,6 +262,9 @@ export interface RenderedSlideArtifact {
 	filename: string;
 	mime_type: "image/png";
 	bytes: Uint8Array;
+	jpeg_filename?: string;
+	jpeg_mime_type?: "image/jpeg";
+	jpeg_bytes?: Uint8Array;
 	width: number;
 	height: number;
 }
@@ -265,6 +278,7 @@ export interface RenderedCarouselArtifact {
 /**
  * Renders all slides in a package using Cloudflare Browser Run and returns raw typed artifacts.
  * Reuses a single browser session for the entire carousel.
+ * Generates both PNG (archival/Telegram) and JPEG (Instagram publishing, quality 95) from each rendered slide.
  */
 export async function renderCarouselArtifacts(
 	contentPackage: ContentGenerationResponse,
@@ -304,6 +318,7 @@ export async function renderCarouselArtifacts(
 		for (let i = 0; i < totalSlides; i++) {
 			const slide = contentPackage.slides[i];
 			const filename = getSlideFilename(slide.slide_number, slide.slide_role);
+			const jpegFilename = getSlideJpegFilename(slide.slide_number, slide.slide_role);
 			const html = generateSlideHtml(slide, i, totalSlides, context);
 
 			await page.setContent(html, { waitUntil: "networkidle0" });
@@ -311,9 +326,21 @@ export async function renderCarouselArtifacts(
 			// Verify fonts readiness in DOM
 			await page.evaluate("document.fonts.ready");
 
-			// Capture screenshot at exact 1080 x 1350
+			// Capture PNG screenshot at exact 1080 x 1350
 			const screenshot = (await page.screenshot({
 				type: "png",
+				clip: {
+					x: 0,
+					y: 0,
+					width: CANVAS.width,
+					height: CANVAS.height,
+				},
+			})) as Uint8Array;
+
+			// Capture JPEG screenshot at quality 95 from the same page and browser session
+			const jpegScreenshot = (await page.screenshot({
+				type: "jpeg",
+				quality: 95,
 				clip: {
 					x: 0,
 					y: 0,
@@ -328,6 +355,9 @@ export async function renderCarouselArtifacts(
 				filename,
 				mime_type: "image/png",
 				bytes: screenshot,
+				jpeg_filename: jpegFilename,
+				jpeg_mime_type: "image/jpeg",
+				jpeg_bytes: jpegScreenshot,
 				width: CANVAS.width,
 				height: CANVAS.height,
 			});
@@ -336,6 +366,7 @@ export async function renderCarouselArtifacts(
 				slide_number: slide.slide_number,
 				slide_role: slide.slide_role,
 				filename,
+				jpeg_filename: jpegFilename,
 				dimensions: {
 					width: CANVAS.width,
 					height: CANVAS.height,
@@ -378,6 +409,9 @@ export async function renderCarouselWithBrowser(
 
 	for (const slide of artifact.slides) {
 		zipFiles[slide.filename] = slide.bytes;
+		if (slide.jpeg_filename && slide.jpeg_bytes) {
+			zipFiles[slide.jpeg_filename] = slide.jpeg_bytes;
+		}
 	}
 	zipFiles["manifest.json"] = artifact.manifestBytes;
 

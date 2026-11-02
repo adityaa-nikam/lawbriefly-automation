@@ -88,6 +88,7 @@ import {
 	renderCarouselArtifacts,
 	handleRenderCarousel,
 	getSlideFilename,
+	getSlideJpegFilename,
 	type RenderedCarouselArtifact,
 	type RenderedSlideArtifact,
 } from "../src/services/carousel-rendering";
@@ -102,6 +103,7 @@ import {
 	validatePersistenceInput,
 	CAROUSEL_STORAGE_BUCKET,
 	SIGNED_URL_DEFAULT_EXPIRY_SECONDS,
+	SUPABASE_STORAGE_MAX_FILE_SIZE_BYTES,
 	RENDERER_VERSION,
 	type PersistedAssetMetadata,
 	type PersistCarouselResult,
@@ -9230,9 +9232,12 @@ describe("Task 10 - Global Hot Legal Topic Selection Using Groq", () => {
 				const evaluateSpy = vi.fn().mockResolvedValue(undefined);
 				const setViewportSpy = vi.fn().mockResolvedValue(undefined);
 				const setContentSpy = vi.fn().mockResolvedValue(undefined);
-				const screenshotSpy = vi.fn().mockImplementation(async () => {
+				const screenshotSpy = vi.fn().mockImplementation(async (opts?: any) => {
 					if (options.shouldFailScreenshot) {
 						throw new Error("Simulated screenshot capture failure");
+					}
+					if (opts?.type === "jpeg") {
+						return createSyntheticJpegBuffer(1080, 1350);
 					}
 					// Return valid mock PNG byte array
 					return new Uint8Array([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, ...new Array(100).fill(0)]);
@@ -9626,7 +9631,7 @@ describe("Task 10 - Global Hot Legal Topic Selection Using Groq", () => {
 					expect(mock.launchSpy).toHaveBeenCalledTimes(1);
 					expect(mock.mockBrowser.newPage).toHaveBeenCalledTimes(1);
 					expect(mock.mockPage.setContent).toHaveBeenCalledTimes(5);
-					expect(mock.mockPage.screenshot).toHaveBeenCalledTimes(5);
+					expect(mock.mockPage.screenshot).toHaveBeenCalledTimes(10); // 5 PNG + 5 JPEG screenshots
 					expect(mock.closeSpy).toHaveBeenCalledTimes(1);
 
 					expect(result.manifest.total_slides).toBe(5);
@@ -10522,7 +10527,7 @@ describe("Task 10 - Global Hot Legal Topic Selection Using Groq", () => {
 					expect(data.post_id).toBe("mock-post-uuid-1234");
 					expect(data.post_status).toBe("stored");
 					expect(data.carousel_slide_count).toBe(5);
-					expect(data.assets).toHaveLength(6);
+					expect(data.assets).toHaveLength(11); // 5 PNG slides + 5 JPEG publishing_slides + 1 manifest
 				});
 
 				it("32. dispatches POST /api/ai/store-carousel via worker.fetch in development mode", async () => {
@@ -13584,6 +13589,474 @@ describe("Task 10 - Global Hot Legal Topic Selection Using Groq", () => {
 					const config = getValidatedInstagramConfig(envUserIdOnly);
 					expect(config.accountId).toBe("17841422733573542");
 					expect(config.apiBaseUrl).toBe("https://graph.instagram.com");
+				});
+			});
+
+			describe("Dual-Format Rendering Architecture (Task 14, Task 15, Task 17)", () => {
+				const mockDevEnv: Env = {
+					...mockInstagramDirectEnv,
+					APP_ENV: "development",
+					MYBROWSER: { fetch: vi.fn() } as any,
+				};
+
+				function createMockDualFormatSupabase(options: { uploadErrorOnManifest?: boolean } = {}) {
+					let post: any = null;
+					let assets: any[] = [];
+					const uploadedFiles = new Map<string, Uint8Array>();
+					const removeSpy = vi.fn().mockResolvedValue({ data: [], error: null });
+
+					const mockClient = {
+						from: vi.fn().mockImplementation((table: string) => {
+							if (table === "social_content_posts") {
+								return {
+									select: vi.fn().mockReturnValue({
+										eq: vi.fn().mockReturnValue({
+											limit: vi.fn().mockResolvedValue({ data: [], error: null }),
+										}),
+									}),
+									insert: vi.fn().mockImplementation((payload: any) => ({
+										select: vi.fn().mockReturnValue({
+											single: vi.fn().mockImplementation(async () => {
+												post = { id: "mock-dual-post-1234", ...payload };
+												return { data: { id: post.id }, error: null };
+											}),
+										}),
+									})),
+									update: vi.fn().mockImplementation((updates: any) => ({
+										eq: vi.fn().mockImplementation(async () => {
+											if (post) post = { ...post, ...updates };
+											return { data: post, error: null };
+										}),
+									})),
+								};
+							}
+
+							if (table === "social_content_assets") {
+								return {
+									delete: vi.fn().mockReturnValue({
+										eq: vi.fn().mockResolvedValue({ data: null, error: null }),
+									}),
+									insert: vi.fn().mockImplementation((rows: any[]) => ({
+										select: vi.fn().mockImplementation(async () => {
+											assets = [...rows];
+											return { data: assets, error: null };
+										}),
+									})),
+									select: vi.fn().mockReturnValue({
+										eq: vi.fn().mockImplementation((field: string, val: string) => ({
+											order: vi.fn().mockImplementation(async () => ({
+												data: [...assets],
+												error: null,
+											})),
+										})),
+									}),
+								};
+							}
+
+							return {
+								select: vi.fn().mockReturnThis(),
+								eq: vi.fn().mockReturnThis(),
+							};
+						}),
+						storage: {
+							from: vi.fn().mockImplementation((bucket: string) => ({
+								upload: vi.fn().mockImplementation(async (path: string, bytes: Uint8Array) => {
+									if (options.uploadErrorOnManifest && path.includes("manifest.json")) {
+										return { data: null, error: new Error("Simulated storage write error") };
+									}
+									uploadedFiles.set(path, bytes);
+									return { data: { path }, error: null };
+								}),
+								createSignedUrl: vi.fn().mockImplementation(async (path: string, expiry: number) => ({
+									data: { signedUrl: `https://test-project.supabase.co/storage/v1/object/sign/${bucket}/${path}?token=mock_token` },
+									error: null,
+								})),
+								download: vi.fn().mockImplementation(async (path: string) => ({
+									data: new Blob([uploadedFiles.get(path) || new Uint8Array([0x89, 0x50, 0x4e, 0x47])]),
+									error: null,
+								})),
+								remove: removeSpy,
+							})),
+						},
+					};
+
+					return {
+						mockClient,
+						removeSpy,
+						uploadedFiles,
+						getAssets: () => [...assets],
+					};
+				}
+
+				it("35. renderCarouselArtifacts generates dual-format artifacts with quality 95 JPEG and filenames in manifest", async () => {
+					const mock = createMockBrowser();
+					const result = await renderCarouselArtifacts(valid5SlidePackage, mockDevEnv);
+
+					expect(result.slides).toHaveLength(5);
+					for (const slide of result.slides) {
+						expect(slide.filename).toMatch(/^slide-\d{2}-.*\.png$/);
+						expect(slide.mime_type).toBe("image/png");
+						expect(slide.bytes).toBeDefined();
+						expect(slide.jpeg_filename).toMatch(/^slide-\d{2}-.*\.jpg$/);
+						expect(slide.jpeg_mime_type).toBe("image/jpeg");
+						expect(slide.jpeg_bytes).toBeDefined();
+						expect(slide.width).toBe(1080);
+						expect(slide.height).toBe(1350);
+					}
+
+					// Verify manifest includes both outputs
+					for (const mSlide of result.manifest.slides) {
+						expect(mSlide.filename).toMatch(/\.png$/);
+						expect(mSlide.jpeg_filename).toMatch(/\.jpg$/);
+						expect(mSlide.dimensions).toEqual({ width: 1080, height: 1350 });
+					}
+
+					// Confirm Puppeteer screenshot was invoked twice per slide with quality 95 for JPEG
+					expect(mock.mockPage.screenshot).toHaveBeenCalledTimes(10);
+					expect(mock.mockPage.screenshot).toHaveBeenCalledWith(
+						expect.objectContaining({ type: "jpeg", quality: 95 })
+					);
+				});
+
+				it("36. getSlideJpegFilename formats standardized JPEG asset filenames", () => {
+					expect(getSlideJpegFilename(1, "cover")).toBe("slide-01-cover.jpg");
+					expect(getSlideJpegFilename(2, "what_happened")).toBe("slide-02-what-happened.jpg");
+				});
+
+				it("37. validatePersistenceInput validates dual-format artifacts and rejects invalid JPEG buffers", () => {
+					const validArtifact: RenderedCarouselArtifact = {
+						manifest: {
+							rendered_at: new Date().toISOString(),
+							total_slides: 5,
+							dimensions: "1080x1350",
+							slides: [],
+						},
+						manifestBytes: new Uint8Array([123, 125]),
+						slides: valid5SlidePackage.slides.map((s, idx) => ({
+							slide_number: idx + 1,
+							slide_role: s.slide_role,
+							filename: `slide-0${idx + 1}.png`,
+							mime_type: "image/png" as const,
+							bytes: new Uint8Array([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]),
+							jpeg_filename: `slide-0${idx + 1}.jpg`,
+							jpeg_mime_type: "image/jpeg" as const,
+							jpeg_bytes: createSyntheticJpegBuffer(1080, 1350),
+							width: 1080,
+							height: 1350,
+						})),
+					};
+
+					const validRes = validatePersistenceInput(valid5SlidePackage, validArtifact);
+					expect(validRes.valid).toBe(true);
+
+					// Corrupt JPEG buffer
+					const corruptArtifact: RenderedCarouselArtifact = {
+						...validArtifact,
+						slides: [
+							{
+								...validArtifact.slides[0],
+								jpeg_bytes: new Uint8Array([0x00, 0x00, 0x00, 0x00]),
+							},
+							...validArtifact.slides.slice(1),
+						],
+					};
+
+					const corruptRes = validatePersistenceInput(valid5SlidePackage, corruptArtifact);
+					expect(corruptRes.valid).toBe(false);
+					expect(corruptRes.error).toContain("does not contain a valid JPEG signature");
+				});
+
+				it("38. validatePersistenceInput rejects artifacts exceeding 5MB Supabase bucket limit", () => {
+					const oversizedPngArtifact: RenderedCarouselArtifact = {
+						manifest: {
+							rendered_at: new Date().toISOString(),
+							total_slides: 5,
+							dimensions: "1080x1350",
+							slides: [],
+						},
+						manifestBytes: new Uint8Array([123, 125]),
+						slides: valid5SlidePackage.slides.map((s, idx) => ({
+							slide_number: idx + 1,
+							slide_role: s.slide_role,
+							filename: `slide-0${idx + 1}.png`,
+							mime_type: "image/png" as const,
+							bytes: idx === 0 
+								? new Uint8Array([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, ...new Array(5.5 * 1024 * 1024).fill(0)])
+								: new Uint8Array([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]),
+							jpeg_filename: `slide-0${idx + 1}.jpg`,
+							jpeg_mime_type: "image/jpeg" as const,
+							jpeg_bytes: createSyntheticJpegBuffer(1080, 1350),
+							width: 1080,
+							height: 1350,
+						})),
+					};
+
+					const res = validatePersistenceInput(valid5SlidePackage, oversizedPngArtifact);
+					expect(res.valid).toBe(false);
+					expect(res.error).toContain("exceeds Supabase storage limit of 5 MB");
+				});
+
+				it("39. persistRenderedCarousel uploads PNGs and JPEGs and creates both slide and publishing_slide asset records", async () => {
+					const mockSupabase = createMockDualFormatSupabase();
+					vi.spyOn(supabaseModule, "getSupabaseClient").mockReturnValue(mockSupabase.mockClient as any);
+
+					const dualArtifact: RenderedCarouselArtifact = {
+						manifest: {
+							rendered_at: new Date().toISOString(),
+							total_slides: 5,
+							dimensions: "1080x1350",
+							slides: [],
+						},
+						manifestBytes: new Uint8Array([123, 125]),
+						slides: valid5SlidePackage.slides.map((s, idx) => ({
+							slide_number: idx + 1,
+							slide_role: s.slide_role,
+							filename: `slide-0${idx + 1}.png`,
+							mime_type: "image/png" as const,
+							bytes: new Uint8Array([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]),
+							jpeg_filename: `slide-0${idx + 1}.jpg`,
+							jpeg_mime_type: "image/jpeg" as const,
+							jpeg_bytes: createSyntheticJpegBuffer(1080, 1350),
+							width: 1080,
+							height: 1350,
+						})),
+					};
+
+					const result = await persistRenderedCarousel(mockDevEnv, valid5SlidePackage, dualArtifact);
+					expect(result.success).toBe(true);
+					expect(result.assets).toHaveLength(11); // 5 PNG slides + 5 JPEG publishing_slides + 1 manifest
+
+					const pngSlides = result.assets.filter((a) => a.asset_type === "slide");
+					const jpegSlides = result.assets.filter((a) => a.asset_type === "publishing_slide");
+					expect(pngSlides).toHaveLength(5);
+					expect(jpegSlides).toHaveLength(5);
+
+					for (const png of pngSlides) {
+						expect(png.storage_path).toMatch(/^posts\/.*\/slide-\d{2}\.png$/);
+						expect(png.mime_type).toBe("image/png");
+					}
+					for (const jpeg of jpegSlides) {
+						expect(jpeg.storage_path).toMatch(/^posts\/.*\/publishing\/slide-\d{2}\.jpg$/);
+						expect(jpeg.mime_type).toBe("image/jpeg");
+					}
+				});
+
+				it("40. persistRenderedCarousel rolls back both PNG and JPEG uploads on failure", async () => {
+					const mockSupabase = createMockDualFormatSupabase({ uploadErrorOnManifest: true });
+					vi.spyOn(supabaseModule, "getSupabaseClient").mockReturnValue(mockSupabase.mockClient as any);
+
+					const dualArtifact: RenderedCarouselArtifact = {
+						manifest: {
+							rendered_at: new Date().toISOString(),
+							total_slides: 5,
+							dimensions: "1080x1350",
+							slides: [],
+						},
+						manifestBytes: new Uint8Array([123, 125]),
+						slides: valid5SlidePackage.slides.map((s, idx) => ({
+							slide_number: idx + 1,
+							slide_role: s.slide_role,
+							filename: `slide-0${idx + 1}.png`,
+							mime_type: "image/png" as const,
+							bytes: new Uint8Array([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]),
+							jpeg_filename: `slide-0${idx + 1}.jpg`,
+							jpeg_mime_type: "image/jpeg" as const,
+							jpeg_bytes: createSyntheticJpegBuffer(1080, 1350),
+							width: 1080,
+							height: 1350,
+						})),
+					};
+
+					await expect(
+						persistRenderedCarousel(mockDevEnv, valid5SlidePackage, dualArtifact)
+					).rejects.toThrow("Carousel persistence failed");
+
+					// Verify compensation cleanup was invoked with all uploaded PNG and JPEG paths
+					expect(mockSupabase.removeSpy).toHaveBeenCalled();
+					const removedPaths = mockSupabase.removeSpy.mock.calls[0][0];
+					expect(removedPaths.some((p: string) => p.endsWith(".png"))).toBe(true);
+					expect(removedPaths.some((p: string) => p.endsWith(".jpg"))).toBe(true);
+				});
+
+				it("41. preparePublishingAssets uses pre-generated publishing_slide JPEGs directly and skips browser conversion", async () => {
+					const postId = "17000000-0000-0000-0000-000000001700";
+					const mockSupabase = createMockDualFormatSupabase();
+
+					// Mock post with carousel_slide_count: 5
+					mockSupabase.mockClient.from = vi.fn().mockImplementation((table: string) => {
+						if (table === "social_content_posts") {
+							return {
+								select: vi.fn().mockReturnThis(),
+								eq: vi.fn().mockReturnThis(),
+								single: vi.fn().mockResolvedValue({
+									data: {
+										id: postId,
+										post_status: "approved",
+										carousel_slide_count: 5,
+										instagram_caption: "Test caption",
+										hashtags: ["#Law"],
+										human_review_required: true,
+									},
+									error: null,
+								}),
+							};
+						}
+						if (table === "social_content_assets") {
+							// Return complete set of publishing_slide JPEG assets
+							const jpegAssets = [1, 2, 3, 4, 5].map((num) => ({
+								id: `asset-jpeg-${num}`,
+								post_id: postId,
+								asset_type: "publishing_slide",
+								asset_key: `slide-0${num}-jpeg`,
+								slide_number: num,
+								storage_bucket: CAROUSEL_STORAGE_BUCKET,
+								storage_path: `posts/${postId}/publishing/slide-0${num}.jpg`,
+								mime_type: "image/jpeg",
+								size_bytes: 50000,
+								sha256: "abc1234567890",
+							}));
+							return {
+								select: vi.fn().mockReturnThis(),
+								eq: vi.fn().mockReturnThis(),
+								order: vi.fn().mockResolvedValue({
+									data: jpegAssets,
+									error: null,
+								}),
+							};
+						}
+						return { select: vi.fn().mockReturnThis() };
+					});
+
+					vi.spyOn(supabaseModule, "getSupabaseClient").mockReturnValue(mockSupabase.mockClient as any);
+
+					const browserSpy = vi.spyOn(puppeteer, "launch");
+
+					const result = await preparePublishingAssets(mockInstagramDirectEnv, postId);
+
+					expect(result.slides).toHaveLength(5);
+					for (const s of result.slides) {
+						expect(s.storage_path).toContain("/publishing/");
+						expect(s.signed_url).toBeDefined();
+					}
+
+					// Verify browser was NEVER launched because pre-generated JPEGs were used!
+					expect(browserSpy).not.toHaveBeenCalled();
+				});
+
+				it("42. preparePublishingAssets falls back to PNG conversion for legacy posts missing publishing_slide assets", async () => {
+					const postId = "17000000-0000-0000-0000-000000001700";
+					const mockSupabase = createMockDualFormatSupabase();
+
+					mockSupabase.mockClient.from = vi.fn().mockImplementation((table: string) => {
+						if (table === "social_content_posts") {
+							return {
+								select: vi.fn().mockReturnThis(),
+								eq: vi.fn().mockReturnThis(),
+								single: vi.fn().mockResolvedValue({
+									data: {
+										id: postId,
+										post_status: "approved",
+										carousel_slide_count: 5,
+										instagram_caption: "Legacy caption",
+										hashtags: [],
+										human_review_required: true,
+									},
+									error: null,
+								}),
+							};
+						}
+						if (table === "social_content_assets") {
+							// Return ONLY PNG slide assets (legacy post)
+							const pngAssets = [1, 2, 3, 4, 5].map((num) => ({
+								id: `asset-png-${num}`,
+								post_id: postId,
+								asset_type: "slide",
+								asset_key: `slide-0${num}`,
+								slide_number: num,
+								storage_bucket: CAROUSEL_STORAGE_BUCKET,
+								storage_path: `posts/${postId}/slide-0${num}.png`,
+								mime_type: "image/png",
+								size_bytes: 60000,
+								sha256: "abc1234567890",
+							}));
+							return {
+								select: vi.fn().mockReturnThis(),
+								eq: vi.fn().mockReturnThis(),
+								order: vi.fn().mockResolvedValue({
+									data: pngAssets,
+									error: null,
+								}),
+							};
+						}
+						return { select: vi.fn().mockReturnThis() };
+					});
+
+					vi.spyOn(supabaseModule, "getSupabaseClient").mockReturnValue(mockSupabase.mockClient as any);
+
+					const customConverter = vi.fn().mockResolvedValue(createSyntheticJpegBuffer(1080, 1350));
+
+					const result = await preparePublishingAssets(mockInstagramDirectEnv, postId, {
+						customConverter,
+					});
+
+					expect(result.slides).toHaveLength(5);
+					// Confirmed customConverter was invoked to convert legacy PNGs to JPEG
+					expect(customConverter).toHaveBeenCalledTimes(5);
+				});
+
+				it("43. preparePublishingAssets rejects incomplete carousel sets and never publishes partial slides", async () => {
+					const postId = "17000000-0000-0000-0000-000000001700";
+					const mockSupabase = createMockDualFormatSupabase();
+
+					mockSupabase.mockClient.from = vi.fn().mockImplementation((table: string) => {
+						if (table === "social_content_posts") {
+							return {
+								select: vi.fn().mockReturnThis(),
+								eq: vi.fn().mockReturnThis(),
+								single: vi.fn().mockResolvedValue({
+									data: {
+										id: postId,
+										post_status: "approved",
+										carousel_slide_count: 5,
+										instagram_caption: "Incomplete test",
+										hashtags: [],
+										human_review_required: true,
+									},
+									error: null,
+								}),
+							};
+						}
+						if (table === "social_content_assets") {
+							// Return only 3 slides (incomplete set)
+							const partialAssets = [1, 2, 3].map((num) => ({
+								id: `asset-jpeg-${num}`,
+								post_id: postId,
+								asset_type: "publishing_slide",
+								asset_key: `slide-0${num}-jpeg`,
+								slide_number: num,
+								storage_bucket: CAROUSEL_STORAGE_BUCKET,
+								storage_path: `posts/${postId}/publishing/slide-0${num}.jpg`,
+								mime_type: "image/jpeg",
+								size_bytes: 50000,
+								sha256: "abc1234567890",
+							}));
+							return {
+								select: vi.fn().mockReturnThis(),
+								eq: vi.fn().mockReturnThis(),
+								order: vi.fn().mockResolvedValue({
+									data: partialAssets,
+									error: null,
+								}),
+							};
+						}
+						return { select: vi.fn().mockReturnThis() };
+					});
+
+					vi.spyOn(supabaseModule, "getSupabaseClient").mockReturnValue(mockSupabase.mockClient as any);
+
+					await expect(preparePublishingAssets(mockInstagramDirectEnv, postId)).rejects.toThrow(
+						"Incomplete carousel assets: post requires 5 slides, but found 3 JPEG(s) and 0 PNG(s). Never publish an incomplete carousel."
+					);
 				});
 			});
 		});
