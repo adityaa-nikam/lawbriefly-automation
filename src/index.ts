@@ -8,6 +8,7 @@ import { handleExtractArticle } from "./services/article-extraction";
 import { handleExtractTopicArticles } from "./services/topic-article-extraction";
 import { handleGenerateContent } from "./services/content-generation";
 import { handleRenderCarousel } from "./services/carousel-rendering";
+import { handleStoreCarousel } from "./services/carousel-persistence";
 
 export interface Env {
 	LAWBRIEFLY_API_URL?: string;
@@ -124,6 +125,10 @@ export default {
 
 		if (url.pathname === "/api/ai/render-carousel" && request.method === "POST") {
 			return await handleRenderCarousel(request, env);
+		}
+
+		if (url.pathname === "/api/ai/store-carousel") {
+			return await handleStoreCarousel(request, env);
 		}
 
 		if (url.pathname === "/api/health/supabase" && request.method === "GET") {

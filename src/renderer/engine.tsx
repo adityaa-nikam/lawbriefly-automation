@@ -162,8 +162,9 @@ export async function renderCarouselToPngs(
 			validationDetails.push(`Slide ${result.slideNumber}: File size suspiciously small (${result.sizeBytes} bytes)`);
 		}
 
-		// Text fit & overflow inspection
-		if (result.svg.includes("NaN") || result.svg.includes("undefined")) {
+		// Text fit & overflow inspection (exclude data URLs where 'NaN' can legitimately appear in base64)
+		const svgWithoutDataUrls = result.svg.replace(/data:image\/[^;]+;base64,[A-Za-z0-9+/=]+/g, "");
+		if (svgWithoutDataUrls.includes("NaN") || svgWithoutDataUrls.includes("undefined")) {
 			overflowDetected = true;
 			validationDetails.push(`Slide ${result.slideNumber}: SVG contains invalid numeric coordinates.`);
 		}

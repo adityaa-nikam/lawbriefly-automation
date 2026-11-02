@@ -1,6 +1,6 @@
 import React from "react";
 import { COLORS, TYPOGRAPHY } from "../tokens";
-import { getLbMonogramSvg } from "../assets";
+import { getLawBrieflyLogoDataUrl } from "../assets";
 
 export interface SlideHeaderProps {
 	slideNumber: number;
@@ -15,7 +15,6 @@ export const SlideHeader: React.FC<SlideHeaderProps> = ({
 	category = "LEGAL BRIEFING",
 	isDark = false,
 }) => {
-	const monogramColor = isDark ? COLORS.brandGold : COLORS.brandNavy;
 	const textColor = isDark ? COLORS.textLightPrimary : COLORS.textDarkPrimary;
 	const mutedColor = isDark ? COLORS.textLightMuted : COLORS.textDarkMuted;
 	const badgeBg = isDark ? "rgba(197, 168, 128, 0.12)" : "rgba(11, 37, 69, 0.06)";
@@ -37,40 +36,18 @@ export const SlideHeader: React.FC<SlideHeaderProps> = ({
 				borderBottom: isDark ? `1px solid rgba(255, 255, 255, 0.08)` : `1px solid ${COLORS.brandLightBorder}`,
 			}}
 		>
-			{/* Left: LawBriefly Monogram & Wordmark */}
+			{/* Left: Authentic LawBriefly Monogram & Wordmark Lockup */}
 			<div style={{ display: "flex", flexDirection: "row", alignItems: "center" }}>
-				{getLbMonogramSvg(monogramColor, 36)}
-				<div
+				<img
+					src={getLawBrieflyLogoDataUrl(isDark)}
+					alt="LawBriefly"
+					width={130}
+					height={42}
 					style={{
-						display: "flex",
-						flexDirection: "row",
-						alignItems: "baseline",
-						marginLeft: "12px",
+						width: "130px",
+						height: "42px",
 					}}
-				>
-					<span
-						style={{
-							fontFamily: TYPOGRAPHY.fontFamily,
-							fontSize: "22px",
-							fontWeight: TYPOGRAPHY.weights.bold,
-							color: textColor,
-							letterSpacing: "-0.5px",
-						}}
-					>
-						Law
-					</span>
-					<span
-						style={{
-							fontFamily: TYPOGRAPHY.fontFamily,
-							fontSize: "22px",
-							fontWeight: TYPOGRAPHY.weights.bold,
-							color: isDark ? COLORS.brandGold : COLORS.brandNavyAccent,
-							letterSpacing: "-0.5px",
-						}}
-					>
-						Briefly
-					</span>
-				</div>
+				/>
 			</div>
 
 			{/* Center: Editorial Category Badge */}

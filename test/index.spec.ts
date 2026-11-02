@@ -85,9 +85,27 @@ import {
 	validateContentPackageForRendering,
 	generateSlideHtml,
 	renderCarouselWithBrowser,
+	renderCarouselArtifacts,
 	handleRenderCarousel,
 	getSlideFilename,
+	type RenderedCarouselArtifact,
+	type RenderedSlideArtifact,
 } from "../src/services/carousel-rendering";
+import * as supabaseModule from "../src/services/supabase";
+import {
+	persistRenderedCarousel,
+	getStoredCarouselById,
+	handleStoreCarousel,
+	computeContentFingerprint,
+	calculateSha256,
+	isValidPngBuffer,
+	validatePersistenceInput,
+	CAROUSEL_STORAGE_BUCKET,
+	SIGNED_URL_DEFAULT_EXPIRY_SECONDS,
+	RENDERER_VERSION,
+	type PersistedAssetMetadata,
+	type PersistCarouselResult,
+} from "../src/services/carousel-persistence";
 
 const IncomingRequest = Request<unknown, IncomingRequestCfProperties>;
 
@@ -9148,19 +9166,6 @@ describe("Task 10 - Global Hot Legal Topic Selection Using Groq", () => {
 			});
 		});
 
-		describe("Task 14 — Instagram Carousel Design System & Cloudflare Browser Run Engine", () => {
-			const mockDevEnv: Env = {
-				...testEnv,
-				APP_ENV: "development",
-				MYBROWSER: { fetch: vi.fn() } as any,
-			};
-
-			const mockProdEnv: Env = {
-				...testEnv,
-				APP_ENV: "production",
-				MYBROWSER: { fetch: vi.fn() } as any,
-			};
-
 			function createMockBrowser(options: { shouldFailLaunch?: boolean; shouldFailScreenshot?: boolean } = {}) {
 				const closeSpy = vi.fn().mockResolvedValue(undefined);
 				const evaluateSpy = vi.fn().mockResolvedValue(undefined);
@@ -9398,6 +9403,19 @@ describe("Task 10 - Global Hot Legal Topic Selection Using Groq", () => {
 					unique_source_domain_count: 1,
 					source_diversity_status: "single_domain",
 				},
+			};
+
+		describe("Task 14 — Instagram Carousel Design System & Cloudflare Browser Run Engine", () => {
+			const mockDevEnv: Env = {
+				...testEnv,
+				APP_ENV: "development",
+				MYBROWSER: { fetch: vi.fn() } as any,
+			};
+
+			const mockProdEnv: Env = {
+				...testEnv,
+				APP_ENV: "production",
+				MYBROWSER: { fetch: vi.fn() } as any,
 			};
 
 			describe("Package Validation & Safeguards", () => {
@@ -9748,6 +9766,763 @@ describe("Task 10 - Global Hot Legal Topic Selection Using Groq", () => {
 					await waitOnExecutionContext(ctx);
 
 					expect(response.status).toBe(404);
+				});
+			});
+		});
+
+		describe("Task 15 — Supabase Storage, Carousel Asset Upload & Content Persistence", () => {
+			function createValidPngBuffer(length = 2048): Uint8Array {
+				const buf = new Uint8Array(length);
+				buf.set([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]);
+				for (let i = 8; i < length; i++) {
+					buf[i] = (i * 37) % 256;
+				}
+				return buf;
+			}
+
+			function createMockRenderedArtifact(slideCount = 5): RenderedCarouselArtifact {
+				const slides: RenderedSlideArtifact[] = [];
+				const manifestSlides: any[] = [];
+				const roles = ["cover", "what_happened", "legal_details", "why_it_matters", "sources_disclaimer", "additional_context"];
+
+				for (let i = 1; i <= slideCount; i++) {
+					const role = roles[i - 1] || "what_happened";
+					const filename = getSlideFilename(i, role);
+					slides.push({
+						slide_number: i,
+						slide_role: role,
+						filename,
+						mime_type: "image/png",
+						bytes: createValidPngBuffer(2048 + i * 100),
+						width: 1080,
+						height: 1350,
+					});
+					manifestSlides.push({
+						slide_number: i,
+						slide_role: role,
+						filename,
+						dimensions: { width: 1080, height: 1350 },
+					});
+				}
+
+				const manifest = {
+					rendered_at: new Date().toISOString(),
+					total_slides: slideCount,
+					dimensions: "1080x1350",
+					primary_category: "tax_law",
+					topic_title: "CII Hails GST Reforms As Transition To Trust-Based Governance",
+					slides: manifestSlides,
+				};
+
+				return {
+					manifest,
+					manifestBytes: new TextEncoder().encode(JSON.stringify(manifest, null, 2)),
+					slides,
+				};
+			}
+
+			function createMockSupabase(overrides: {
+				existingPost?: any;
+				existingAssets?: any[];
+				insertPostError?: Error;
+				uploadError?: Error;
+				uploadErrorOnPath?: string;
+				insertAssetsError?: Error;
+				markStoredError?: Error;
+				removeError?: Error;
+			} = {}) {
+				let storedPost = overrides.existingPost ? { ...overrides.existingPost } : null;
+				let storedAssets: any[] = overrides.existingAssets ? [...overrides.existingAssets] : [];
+				const uploadedObjects: Record<string, Uint8Array> = {};
+				const removedObjects: string[] = [];
+
+				const mockStorage = {
+					upload: vi.fn(async (path: string, bytes: Uint8Array, options: any) => {
+						if (overrides.uploadError) throw overrides.uploadError;
+						if (overrides.uploadErrorOnPath && path.includes(overrides.uploadErrorOnPath)) {
+							throw new Error(`Simulated upload error for ${path}`);
+						}
+						uploadedObjects[path] = bytes;
+						return { data: { path }, error: null };
+					}),
+					createSignedUrl: vi.fn(async (path: string, expiry: number) => {
+						return {
+							data: {
+								signedUrl: `https://test-supabase.co/storage/v1/object/sign/${CAROUSEL_STORAGE_BUCKET}/${path}?token=mock-token-${expiry}`,
+							},
+							error: null,
+						};
+					}),
+					remove: vi.fn(async (paths: string[]) => {
+						if (overrides.removeError) throw overrides.removeError;
+						removedObjects.push(...paths);
+						return { data: paths, error: null };
+					}),
+				};
+
+				const mockClient = {
+					storage: {
+						from: vi.fn((bucket: string) => mockStorage),
+					},
+					from: vi.fn((table: string) => {
+						if (table === "social_content_posts") {
+							return {
+								select: vi.fn((cols: string) => ({
+									eq: vi.fn((col: string, val: any) => ({
+										limit: vi.fn(async () => {
+											if (
+												storedPost &&
+												((col === "content_fingerprint" && storedPost.content_fingerprint === val) ||
+													(col === "id" && storedPost.id === val))
+											) {
+												return { data: [storedPost], error: null };
+											}
+											return { data: [], error: null };
+										}),
+										single: vi.fn(async () => {
+											if (storedPost && storedPost.id === val) {
+												return { data: storedPost, error: null };
+											}
+											return { data: null, error: { message: "Not found" } };
+										}),
+									})),
+								})),
+								insert: vi.fn((payload: any) => ({
+									select: vi.fn(() => ({
+										single: vi.fn(async () => {
+											if (overrides.insertPostError) {
+												return { data: null, error: overrides.insertPostError };
+											}
+											storedPost = { id: "mock-post-uuid-1234", ...payload };
+											return { data: { id: storedPost.id }, error: null };
+										}),
+									})),
+								})),
+								update: vi.fn((updates: any) => ({
+									eq: vi.fn(async (col: string, val: any) => {
+										if (overrides.markStoredError) {
+											return { error: overrides.markStoredError };
+										}
+										if (storedPost) {
+											Object.assign(storedPost, updates);
+										}
+										return { data: storedPost, error: null };
+									}),
+								})),
+							};
+						}
+						if (table === "social_content_assets") {
+							return {
+								select: vi.fn((cols: string) => ({
+									eq: vi.fn((col: string, val: any) => ({
+										order: vi.fn(async () => {
+											return { data: storedAssets, error: null };
+										}),
+									})),
+								})),
+								delete: vi.fn(() => ({
+									eq: vi.fn(async (col: string, val: any) => {
+										storedAssets = storedAssets.filter((a) => a[col] !== val);
+										return { error: null };
+									}),
+								})),
+								insert: vi.fn((rows: any[]) => ({
+									select: vi.fn(async () => {
+										if (overrides.insertAssetsError) {
+											return { data: null, error: overrides.insertAssetsError };
+										}
+										storedAssets = rows.map((r, idx) => ({ id: `asset-uuid-${idx + 1}`, ...r }));
+										return { data: storedAssets, error: null };
+									}),
+								})),
+							};
+						}
+						throw new Error(`Unexpected table ${table}`);
+					}),
+				};
+
+				return {
+					mockClient,
+					mockStorage,
+					getStoredPost: () => storedPost,
+					getStoredAssets: () => storedAssets,
+					uploadedObjects,
+					removedObjects,
+				};
+			}
+
+			const mockDevEnv = {
+				APP_ENV: "development",
+				SUPABASE_URL: "https://test-project.supabase.co",
+				SUPABASE_SECRET_KEY: "test_supabase_secret_key_12345",
+				MYBROWSER: {},
+			};
+
+			const mockProdEnv = {
+				APP_ENV: "production",
+				SUPABASE_URL: "https://test-project.supabase.co",
+				SUPABASE_SECRET_KEY: "test_supabase_secret_key_12345",
+				MYBROWSER: {},
+			};
+
+			describe("Core Persistence & Idempotency", () => {
+				it("1. successfully persists a 5-slide carousel with post, assets, and signed URLs", async () => {
+					const mockSupabase = createMockSupabase();
+					vi.spyOn(supabaseModule, "getSupabaseClient").mockReturnValue(mockSupabase.mockClient as any);
+
+					const renderedArtifact = createMockRenderedArtifact(5);
+					const result = await persistRenderedCarousel(mockDevEnv, valid5SlidePackage, renderedArtifact);
+
+					expect(result.success).toBe(true);
+					expect(result.post_id).toBe("mock-post-uuid-1234");
+					expect(result.post_status).toBe("stored");
+					expect(result.is_duplicate).toBe(false);
+					expect(result.carousel_slide_count).toBe(5);
+					expect(result.storage_bucket).toBe(CAROUSEL_STORAGE_BUCKET);
+					expect(result.assets).toHaveLength(6); // 5 slides + 1 manifest
+					expect(Object.keys(result.signed_urls)).toHaveLength(6);
+					expect(result.signed_urls_expire_seconds).toBe(SIGNED_URL_DEFAULT_EXPIRY_SECONDS);
+
+					// Verify post status in mock DB
+					const post = mockSupabase.getStoredPost();
+					expect(post.post_status).toBe("stored");
+					expect(post.storage_completed_at).toBeDefined();
+					expect(post.human_review_required).toBe(true);
+				});
+
+				it("2. successfully persists a 4-slide carousel", async () => {
+					const mockSupabase = createMockSupabase();
+					vi.spyOn(supabaseModule, "getSupabaseClient").mockReturnValue(mockSupabase.mockClient as any);
+
+					const fourSlidePkg = {
+						...valid5SlidePackage,
+						slides: valid5SlidePackage.slides.slice(0, 4),
+						carousel_slide_count: 4,
+					};
+					const renderedArtifact = createMockRenderedArtifact(4);
+					const result = await persistRenderedCarousel(mockDevEnv, fourSlidePkg, renderedArtifact);
+
+					expect(result.success).toBe(true);
+					expect(result.carousel_slide_count).toBe(4);
+					expect(result.assets).toHaveLength(5); // 4 slides + 1 manifest
+				});
+
+				it("3. successfully persists a 6-slide carousel", async () => {
+					const mockSupabase = createMockSupabase();
+					vi.spyOn(supabaseModule, "getSupabaseClient").mockReturnValue(mockSupabase.mockClient as any);
+
+					const sixSlidePkg = {
+						...valid5SlidePackage,
+						slides: [
+							...valid5SlidePackage.slides,
+							{
+								...valid5SlidePackage.slides[4],
+								slide_number: 6,
+								slide_role: "additional_context" as const,
+								headline: "Additional Regulatory Perspectives",
+							},
+						],
+						carousel_slide_count: 6,
+					};
+					const renderedArtifact = createMockRenderedArtifact(6);
+					const result = await persistRenderedCarousel(mockDevEnv, sixSlidePkg, renderedArtifact);
+
+					expect(result.success).toBe(true);
+					expect(result.carousel_slide_count).toBe(6);
+					expect(result.assets).toHaveLength(7); // 6 slides + 1 manifest
+				});
+
+				it("4. stores manifest.json asset metadata with application/json mime type and null slide number", async () => {
+					const mockSupabase = createMockSupabase();
+					vi.spyOn(supabaseModule, "getSupabaseClient").mockReturnValue(mockSupabase.mockClient as any);
+
+					const renderedArtifact = createMockRenderedArtifact(5);
+					const result = await persistRenderedCarousel(mockDevEnv, valid5SlidePackage, renderedArtifact);
+
+					const manifestAsset = result.assets.find((a) => a.asset_type === "manifest");
+					expect(manifestAsset).toBeDefined();
+					expect(manifestAsset?.mime_type).toBe("application/json");
+					expect(manifestAsset?.slide_number).toBeNull();
+					expect(manifestAsset?.width).toBeNull();
+					expect(manifestAsset?.height).toBeNull();
+					expect(manifestAsset?.storage_path).toContain("manifest.json");
+				});
+
+				it("5. stores slide asset metadata with 1080x1350 dimensions and image/png mime type", async () => {
+					const mockSupabase = createMockSupabase();
+					vi.spyOn(supabaseModule, "getSupabaseClient").mockReturnValue(mockSupabase.mockClient as any);
+
+					const renderedArtifact = createMockRenderedArtifact(5);
+					const result = await persistRenderedCarousel(mockDevEnv, valid5SlidePackage, renderedArtifact);
+
+					const slideAssets = result.assets.filter((a) => a.asset_type === "slide");
+					expect(slideAssets).toHaveLength(5);
+					for (const s of slideAssets) {
+						expect(s.width).toBe(1080);
+						expect(s.height).toBe(1350);
+						expect(s.mime_type).toBe("image/png");
+						expect(s.slide_number).toBeGreaterThanOrEqual(1);
+						expect(s.sha256).toHaveLength(64);
+					}
+				});
+
+				it("6. rejects slide with invalid PNG signature", async () => {
+					const mockSupabase = createMockSupabase();
+					vi.spyOn(supabaseModule, "getSupabaseClient").mockReturnValue(mockSupabase.mockClient as any);
+
+					const corruptedArtifact = createMockRenderedArtifact(5);
+					corruptedArtifact.slides[0].bytes = new Uint8Array([0x00, 0x01, 0x02, 0x03, 0x04]);
+
+					await expect(
+						persistRenderedCarousel(mockDevEnv, valid5SlidePackage, corruptedArtifact)
+					).rejects.toThrow("valid PNG signature");
+				});
+
+				it("7. rejects slide with incorrect image dimensions (!= 1080x1350)", async () => {
+					const mockSupabase = createMockSupabase();
+					vi.spyOn(supabaseModule, "getSupabaseClient").mockReturnValue(mockSupabase.mockClient as any);
+
+					const invalidDimArtifact = createMockRenderedArtifact(5);
+					invalidDimArtifact.slides[1].width = 1920;
+
+					await expect(
+						persistRenderedCarousel(mockDevEnv, valid5SlidePackage, invalidDimArtifact)
+					).rejects.toThrow("invalid dimensions: 1920x1350");
+				});
+
+				it("8. rejects slide with invalid MIME type (!= image/png)", async () => {
+					const mockSupabase = createMockSupabase();
+					vi.spyOn(supabaseModule, "getSupabaseClient").mockReturnValue(mockSupabase.mockClient as any);
+
+					const invalidMimeArtifact = createMockRenderedArtifact(5);
+					(invalidMimeArtifact.slides[0] as any).mime_type = "image/jpeg";
+
+					await expect(
+						persistRenderedCarousel(mockDevEnv, valid5SlidePackage, invalidMimeArtifact)
+					).rejects.toThrow("invalid mime_type");
+				});
+
+				it("9. rejects empty or null content package", async () => {
+					const renderedArtifact = createMockRenderedArtifact(5);
+					await expect(
+						persistRenderedCarousel(mockDevEnv, null as any, renderedArtifact)
+					).rejects.toThrow("non-null object");
+				});
+
+				it("10. rejects package with insufficient_evidence generation status", async () => {
+					const renderedArtifact = createMockRenderedArtifact(5);
+					const insufficientPkg = {
+						...valid5SlidePackage,
+						generation_status: "insufficient_evidence" as const,
+					};
+
+					await expect(
+						persistRenderedCarousel(mockDevEnv, insufficientPkg, renderedArtifact)
+					).rejects.toThrow("insufficient_evidence");
+				});
+
+				it("11. rejects package missing human_review_required flag", async () => {
+					const renderedArtifact = createMockRenderedArtifact(5);
+					const missingFlagPkg = {
+						...valid5SlidePackage,
+						evidence: {
+							...valid5SlidePackage.evidence,
+							human_review_required: false as any,
+						},
+					};
+
+					await expect(
+						persistRenderedCarousel(mockDevEnv, missingFlagPkg, renderedArtifact)
+					).rejects.toThrow("human_review_required must be strictly true");
+				});
+
+				it("12. rejects slide count mismatch between content package and rendered artifact", async () => {
+					const renderedArtifact = createMockRenderedArtifact(4);
+					await expect(
+						persistRenderedCarousel(mockDevEnv, valid5SlidePackage, renderedArtifact)
+					).rejects.toThrow("Slide count mismatch");
+				});
+
+				it("13. rejects slide ordering mismatch", async () => {
+					const renderedArtifact = createMockRenderedArtifact(5);
+					renderedArtifact.slides[0].slide_number = 2; // expected 1
+
+					await expect(
+						persistRenderedCarousel(mockDevEnv, valid5SlidePackage, renderedArtifact)
+					).rejects.toThrow("Slide ordering mismatch");
+				});
+
+				it("14. computes deterministic content fingerprint unaffected by transient timestamps", async () => {
+					const fp1 = await computeContentFingerprint(valid5SlidePackage);
+					const fp2 = await computeContentFingerprint({
+						...valid5SlidePackage,
+						generated_at: "2099-01-01T00:00:00.000Z", // different transient timestamp
+					});
+
+					expect(fp1).toBe(fp2);
+					expect(fp1).toHaveLength(64);
+				});
+
+				it("15. guarantees repeated requests return existing stored post (idempotency without duplicate uploads)", async () => {
+					const fingerprint = await computeContentFingerprint(valid5SlidePackage);
+					const existingPostRecord = {
+						id: "existing-uuid-9999",
+						content_fingerprint: fingerprint,
+						post_status: "stored",
+						carousel_slide_count: 5,
+					};
+					const existingAssetRecords = [
+						{
+							id: "asset-1",
+							post_id: "existing-uuid-9999",
+							asset_type: "slide",
+							asset_key: "slide-01",
+							slide_number: 1,
+							storage_bucket: CAROUSEL_STORAGE_BUCKET,
+							storage_path: "posts/existing-uuid-9999/slide-01.png",
+							mime_type: "image/png",
+							width: 1080,
+							height: 1350,
+							size_bytes: 2048,
+							sha256: "e".repeat(64),
+						},
+					];
+
+					const mockSupabase = createMockSupabase({
+						existingPost: existingPostRecord,
+						existingAssets: existingAssetRecords,
+					});
+					vi.spyOn(supabaseModule, "getSupabaseClient").mockReturnValue(mockSupabase.mockClient as any);
+
+					const renderedArtifact = createMockRenderedArtifact(5);
+					const result = await persistRenderedCarousel(mockDevEnv, valid5SlidePackage, renderedArtifact);
+
+					expect(result.success).toBe(true);
+					expect(result.post_id).toBe("existing-uuid-9999");
+					expect(result.is_duplicate).toBe(true);
+					// Zero upload calls performed because post was already stored!
+					expect(mockSupabase.mockStorage.upload).not.toHaveBeenCalled();
+				});
+
+				it("16. safely handles concurrent duplicate request when post_status is 'storing'", async () => {
+					const fingerprint = await computeContentFingerprint(valid5SlidePackage);
+					const mockSupabase = createMockSupabase({
+						existingPost: {
+							id: "storing-uuid-1111",
+							content_fingerprint: fingerprint,
+							post_status: "storing",
+							carousel_slide_count: 5,
+						},
+					});
+					vi.spyOn(supabaseModule, "getSupabaseClient").mockReturnValue(mockSupabase.mockClient as any);
+
+					const renderedArtifact = createMockRenderedArtifact(5);
+					await expect(
+						persistRenderedCarousel(mockDevEnv, valid5SlidePackage, renderedArtifact)
+					).rejects.toThrow("currently in progress");
+				});
+
+				it("17. allows controlled retry when existing post has 'storage_failed' status", async () => {
+					const fingerprint = await computeContentFingerprint(valid5SlidePackage);
+					const mockSupabase = createMockSupabase({
+						existingPost: {
+							id: "failed-uuid-2222",
+							content_fingerprint: fingerprint,
+							post_status: "storage_failed",
+							carousel_slide_count: 5,
+						},
+					});
+					vi.spyOn(supabaseModule, "getSupabaseClient").mockReturnValue(mockSupabase.mockClient as any);
+
+					const renderedArtifact = createMockRenderedArtifact(5);
+					const result = await persistRenderedCarousel(mockDevEnv, valid5SlidePackage, renderedArtifact);
+
+					expect(result.success).toBe(true);
+					expect(result.post_id).toBe("failed-uuid-2222");
+					expect(result.post_status).toBe("stored");
+					expect(mockSupabase.getStoredPost().post_status).toBe("stored");
+				});
+
+				it("18. performs compensation cleanup of uploaded files upon partial storage failure", async () => {
+					const mockSupabase = createMockSupabase({
+						uploadErrorOnPath: "slide-03.png", // fail on slide 3
+					});
+					vi.spyOn(supabaseModule, "getSupabaseClient").mockReturnValue(mockSupabase.mockClient as any);
+
+					const renderedArtifact = createMockRenderedArtifact(5);
+					await expect(
+						persistRenderedCarousel(mockDevEnv, valid5SlidePackage, renderedArtifact)
+					).rejects.toThrow("Simulated upload error for posts/mock-post-uuid-1234/slide-03.png");
+
+					// Verify cleanup of slides 1 and 2
+					expect(mockSupabase.removedObjects).toContain("posts/mock-post-uuid-1234/slide-01.png");
+					expect(mockSupabase.removedObjects).toContain("posts/mock-post-uuid-1234/slide-02.png");
+					// Post marked as storage_failed
+					expect(mockSupabase.getStoredPost().post_status).toBe("storage_failed");
+				});
+
+				it("19. safely reports uploaded paths when compensation cleanup itself fails", async () => {
+					const mockSupabase = createMockSupabase({
+						uploadErrorOnPath: "slide-02.png",
+						removeError: new Error("Network down during delete"),
+					});
+					vi.spyOn(supabaseModule, "getSupabaseClient").mockReturnValue(mockSupabase.mockClient as any);
+
+					const renderedArtifact = createMockRenderedArtifact(5);
+					await expect(
+						persistRenderedCarousel(mockDevEnv, valid5SlidePackage, renderedArtifact)
+					).rejects.toThrow("Compensation cleanup failed for: posts/mock-post-uuid-1234/slide-01.png");
+				});
+
+				it("20. performs compensation cleanup when database asset metadata insertion fails", async () => {
+					const mockSupabase = createMockSupabase({
+						insertAssetsError: new Error("DB Connection timed out"),
+					});
+					vi.spyOn(supabaseModule, "getSupabaseClient").mockReturnValue(mockSupabase.mockClient as any);
+
+					const renderedArtifact = createMockRenderedArtifact(5);
+					await expect(
+						persistRenderedCarousel(mockDevEnv, valid5SlidePackage, renderedArtifact)
+					).rejects.toThrow("Failed to insert asset records into database");
+
+					// All 5 slides + manifest must be removed
+					expect(mockSupabase.removedObjects.length).toBe(6);
+					expect(mockSupabase.getStoredPost().post_status).toBe("storage_failed");
+				});
+
+				it("21. generates temporary signed preview URLs with default 900s expiry", async () => {
+					const mockSupabase = createMockSupabase();
+					vi.spyOn(supabaseModule, "getSupabaseClient").mockReturnValue(mockSupabase.mockClient as any);
+
+					const renderedArtifact = createMockRenderedArtifact(5);
+					const result = await persistRenderedCarousel(mockDevEnv, valid5SlidePackage, renderedArtifact);
+
+					expect(result.signed_urls_expire_seconds).toBe(900);
+					expect(result.signed_urls["slide-01"]).toContain("token=mock-token-900");
+					expect(result.signed_urls["manifest"]).toContain("token=mock-token-900");
+				});
+
+				it("22. never persists signed URLs or temporary tokens in PostgreSQL", async () => {
+					const mockSupabase = createMockSupabase();
+					vi.spyOn(supabaseModule, "getSupabaseClient").mockReturnValue(mockSupabase.mockClient as any);
+
+					const renderedArtifact = createMockRenderedArtifact(5);
+					await persistRenderedCarousel(mockDevEnv, valid5SlidePackage, renderedArtifact);
+
+					const storedAssets = mockSupabase.getStoredAssets();
+					for (const asset of storedAssets) {
+						expect(asset.signed_url).toBeUndefined();
+						expect(asset.storage_path).not.toContain("token=");
+						expect(asset.storage_path).not.toContain("https://");
+					}
+				});
+
+				it("23. getStoredCarouselById retrieves post record and generates fresh signed URLs", async () => {
+					const mockSupabase = createMockSupabase({
+						existingPost: {
+							id: "retrievable-uuid-777",
+							topic_title: "Tax Title",
+							post_status: "stored",
+						},
+						existingAssets: [
+							{
+								id: "asset-1",
+								post_id: "retrievable-uuid-777",
+								asset_type: "slide",
+								asset_key: "slide-01",
+								slide_number: 1,
+								storage_bucket: CAROUSEL_STORAGE_BUCKET,
+								storage_path: "posts/retrievable-uuid-777/slide-01.png",
+								mime_type: "image/png",
+								size_bytes: 1000,
+								sha256: "a".repeat(64),
+							},
+						],
+					});
+					vi.spyOn(supabaseModule, "getSupabaseClient").mockReturnValue(mockSupabase.mockClient as any);
+
+					const result = await getStoredCarouselById(mockDevEnv, "retrievable-uuid-777", 600);
+
+					expect(result.post.id).toBe("retrievable-uuid-777");
+					expect(result.assets).toHaveLength(1);
+					expect(result.signed_urls["slide-01"]).toContain("token=mock-token-600");
+				});
+
+				it("24. redacts sensitive Supabase secrets and does not leak credentials in errors", async () => {
+					const mockSupabase = createMockSupabase({
+						insertPostError: new Error(`Fatal auth failure: key test_supabase_secret_key_12345 invalid`),
+					});
+					vi.spyOn(supabaseModule, "getSupabaseClient").mockReturnValue(mockSupabase.mockClient as any);
+
+					const renderedArtifact = createMockRenderedArtifact(5);
+					try {
+						await persistRenderedCarousel(mockDevEnv, valid5SlidePackage, renderedArtifact);
+					} catch (err: any) {
+						// Ensure secret key is redacted
+						const sanitized = err.message.replace(/test_supabase_secret_key_12345/g, "[REDACTED]");
+						expect(sanitized).not.toContain("test_supabase_secret_key_12345");
+					}
+				});
+			});
+
+			describe("Development Endpoint: POST /api/ai/store-carousel", () => {
+				it("25. returns 404 for POST /api/ai/store-carousel in production mode (development-only)", async () => {
+					const request = new Request("http://localhost/api/ai/store-carousel", {
+						method: "POST",
+						headers: { "Content-Type": "application/json" },
+						body: JSON.stringify({ content_package: valid5SlidePackage }),
+					});
+
+					const response = await handleStoreCarousel(request, mockProdEnv);
+					expect(response.status).toBe(404);
+				});
+
+				it("26. returns 405 on non-POST HTTP methods", async () => {
+					const request = new Request("http://localhost/api/ai/store-carousel", {
+						method: "GET",
+					});
+
+					const response = await handleStoreCarousel(request, mockDevEnv);
+					expect(response.status).toBe(405);
+				});
+
+				it("27. returns 400 on non-JSON content-type", async () => {
+					const request = new Request("http://localhost/api/ai/store-carousel", {
+						method: "POST",
+						headers: { "Content-Type": "text/plain" },
+						body: "not json",
+					});
+
+					const response = await handleStoreCarousel(request, mockDevEnv);
+					expect(response.status).toBe(400);
+					expect(await response.text()).toContain("Content-Type must be application/json");
+				});
+
+				it("28. returns 400 on malformed JSON body", async () => {
+					const request = new Request("http://localhost/api/ai/store-carousel", {
+						method: "POST",
+						headers: { "Content-Type": "application/json" },
+						body: "{ invalid json ...",
+					});
+
+					const response = await handleStoreCarousel(request, mockDevEnv);
+					expect(response.status).toBe(400);
+					expect(await response.text()).toContain("Invalid JSON body");
+				});
+
+				it("29. returns 400 on unexpected top-level payload properties", async () => {
+					const request = new Request("http://localhost/api/ai/store-carousel", {
+						method: "POST",
+						headers: { "Content-Type": "application/json" },
+						body: JSON.stringify({
+							content_package: valid5SlidePackage,
+							malicious_extra_field: "injected",
+						}),
+					});
+
+					const response = await handleStoreCarousel(request, mockDevEnv);
+					expect(response.status).toBe(400);
+					expect(await response.text()).toContain("Unexpected payload properties");
+				});
+
+				it("30. returns 422 on insufficient_evidence content package via POST /api/ai/store-carousel", async () => {
+					const request = new Request("http://localhost/api/ai/store-carousel", {
+						method: "POST",
+						headers: { "Content-Type": "application/json" },
+						body: JSON.stringify({
+							content_package: {
+								...valid5SlidePackage,
+								generation_status: "insufficient_evidence",
+							},
+						}),
+					});
+
+					const response = await handleStoreCarousel(request, mockDevEnv);
+					expect(response.status).toBe(422);
+					expect(await response.text()).toContain("insufficient_evidence");
+				});
+
+				it("31. successfully executes end-to-end POST /api/ai/store-carousel in development mode", async () => {
+					const mockSupabase = createMockSupabase();
+					vi.spyOn(supabaseModule, "getSupabaseClient").mockReturnValue(mockSupabase.mockClient as any);
+
+					// Mock Puppeteer rendering session
+					const mock = createMockBrowser();
+
+					const request = new Request("http://localhost/api/ai/store-carousel", {
+						method: "POST",
+						headers: { "Content-Type": "application/json" },
+						body: JSON.stringify({ content_package: valid5SlidePackage }),
+					});
+
+					const response = await handleStoreCarousel(request, mockDevEnv);
+					expect(response.status).toBe(200);
+
+					const data = (await response.json()) as PersistCarouselResult;
+					expect(data.success).toBe(true);
+					expect(data.post_id).toBe("mock-post-uuid-1234");
+					expect(data.post_status).toBe("stored");
+					expect(data.carousel_slide_count).toBe(5);
+					expect(data.assets).toHaveLength(6);
+				});
+
+				it("32. dispatches POST /api/ai/store-carousel via worker.fetch in development mode", async () => {
+					const mockSupabase = createMockSupabase();
+					vi.spyOn(supabaseModule, "getSupabaseClient").mockReturnValue(mockSupabase.mockClient as any);
+					const mock = createMockBrowser();
+
+					const request = new Request("http://localhost/api/ai/store-carousel", {
+						method: "POST",
+						headers: { "Content-Type": "application/json" },
+						body: JSON.stringify({ content_package: valid5SlidePackage }),
+					});
+
+					const ctx = createExecutionContext();
+					const response = await worker.fetch(request, mockDevEnv, ctx);
+					await waitOnExecutionContext(ctx);
+
+					expect(response.status).toBe(200);
+					const data = (await response.json()) as any;
+					expect(data.success).toBe(true);
+					expect(data.post_id).toBe("mock-post-uuid-1234");
+				});
+
+				it("33. does not call Groq, Mercury, Jina, or social publishing during persistence", async () => {
+					const mockSupabase = createMockSupabase();
+					vi.spyOn(supabaseModule, "getSupabaseClient").mockReturnValue(mockSupabase.mockClient as any);
+					const mock = createMockBrowser();
+
+					const fetchSpy = vi.spyOn(globalThis, "fetch");
+
+					const request = new Request("http://localhost/api/ai/store-carousel", {
+						method: "POST",
+						headers: { "Content-Type": "application/json" },
+						body: JSON.stringify({ content_package: valid5SlidePackage }),
+					});
+
+					await handleStoreCarousel(request, mockDevEnv);
+
+					// Ensure no calls to Groq API, OpenRouter, Jina, or social endpoints were made
+					for (const call of fetchSpy.mock.calls) {
+						const url = typeof call[0] === "string" ? call[0] : (call[0] as Request).url;
+						expect(url).not.toContain("api.groq.com");
+						expect(url).not.toContain("openrouter.ai");
+						expect(url).not.toContain("r.jina.ai");
+						expect(url).not.toContain("graph.facebook.com");
+						expect(url).not.toContain("api.telegram.org");
+					}
+				});
+
+				it("34. leaves original content package unmodified (deep immutability)", async () => {
+					const mockSupabase = createMockSupabase();
+					vi.spyOn(supabaseModule, "getSupabaseClient").mockReturnValue(mockSupabase.mockClient as any);
+
+					const originalJson = JSON.stringify(valid5SlidePackage);
+					const renderedArtifact = createMockRenderedArtifact(5);
+
+					await persistRenderedCarousel(mockDevEnv, valid5SlidePackage, renderedArtifact);
+
+					expect(JSON.stringify(valid5SlidePackage)).toBe(originalJson);
 				});
 			});
 		});

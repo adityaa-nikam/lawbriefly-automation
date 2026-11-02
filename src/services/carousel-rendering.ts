@@ -246,14 +246,30 @@ export function getSlideFilename(slideNumber: number, role: string): string {
 	return `slide-${padded}-${slug}.png`;
 }
 
+export interface RenderedSlideArtifact {
+	slide_number: number;
+	slide_role: string;
+	filename: string;
+	mime_type: "image/png";
+	bytes: Uint8Array;
+	width: number;
+	height: number;
+}
+
+export interface RenderedCarouselArtifact {
+	manifest: RenderManifest;
+	manifestBytes: Uint8Array;
+	slides: RenderedSlideArtifact[];
+}
+
 /**
- * Renders all slides in a package using Cloudflare Browser Run.
+ * Renders all slides in a package using Cloudflare Browser Run and returns raw typed artifacts.
  * Reuses a single browser session for the entire carousel.
  */
-export async function renderCarouselWithBrowser(
+export async function renderCarouselArtifacts(
 	contentPackage: ContentGenerationResponse,
 	env: Env
-): Promise<{ zipBuffer: Uint8Array; manifest: RenderManifest }> {
+): Promise<RenderedCarouselArtifact> {
 	if (!env.MYBROWSER) {
 		throw new Error("Browser binding MYBROWSER is not available in environment.");
 	}
@@ -271,7 +287,7 @@ export async function renderCarouselWithBrowser(
 	};
 
 	const manifestSlides: RenderManifestSlide[] = [];
-	const zipFiles: Record<string, Uint8Array> = {};
+	const slides: RenderedSlideArtifact[] = [];
 
 	// Launch single browser instance for all slides
 	const browser = await puppeteer.launch(env.MYBROWSER);
@@ -306,7 +322,16 @@ export async function renderCarouselWithBrowser(
 				},
 			})) as Uint8Array;
 
-			zipFiles[filename] = screenshot;
+			slides.push({
+				slide_number: slide.slide_number,
+				slide_role: slide.slide_role,
+				filename,
+				mime_type: "image/png",
+				bytes: screenshot,
+				width: CANVAS.width,
+				height: CANVAS.height,
+			});
+
 			manifestSlides.push({
 				slide_number: slide.slide_number,
 				slide_role: slide.slide_role,
@@ -331,12 +356,33 @@ export async function renderCarouselWithBrowser(
 		slides: manifestSlides,
 	};
 
-	zipFiles["manifest.json"] = new TextEncoder().encode(
-		JSON.stringify(manifest, null, 2)
-	);
+	const manifestBytes = new TextEncoder().encode(JSON.stringify(manifest, null, 2));
+
+	return {
+		manifest,
+		manifestBytes,
+		slides,
+	};
+}
+
+/**
+ * Renders all slides in a package using Cloudflare Browser Run and returns a packed ZIP archive.
+ * Reuses a single browser session for the entire carousel.
+ */
+export async function renderCarouselWithBrowser(
+	contentPackage: ContentGenerationResponse,
+	env: Env
+): Promise<{ zipBuffer: Uint8Array; manifest: RenderManifest }> {
+	const artifact = await renderCarouselArtifacts(contentPackage, env);
+	const zipFiles: Record<string, Uint8Array> = {};
+
+	for (const slide of artifact.slides) {
+		zipFiles[slide.filename] = slide.bytes;
+	}
+	zipFiles["manifest.json"] = artifact.manifestBytes;
 
 	const zipBuffer = zipSync(zipFiles);
-	return { zipBuffer, manifest };
+	return { zipBuffer, manifest: artifact.manifest };
 }
 
 /**

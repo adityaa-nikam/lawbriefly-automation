@@ -1,6 +1,6 @@
 import React from "react";
 import { COLORS, TYPOGRAPHY } from "../tokens";
-import { getLbMonogramSvg } from "../assets";
+import { getLawBrieflyLogoDataUrl } from "../assets";
 
 export interface BrandSignatureProps {
 	isDark?: boolean;
@@ -9,9 +9,6 @@ export interface BrandSignatureProps {
 export const BrandSignature: React.FC<BrandSignatureProps> = ({ isDark = false }) => {
 	const cardBg = isDark ? COLORS.brandDarkElevated : "rgba(11, 37, 69, 0.04)";
 	const borderColor = isDark ? COLORS.brandGoldBorder : "rgba(11, 37, 69, 0.12)";
-	const monogramColor = isDark ? COLORS.brandGold : COLORS.brandNavy;
-	const textColor = isDark ? COLORS.textLightPrimary : COLORS.textDarkPrimary;
-	const tagColor = isDark ? COLORS.brandGoldLight : COLORS.brandNavyAccent;
 
 	return (
 		<div
@@ -27,48 +24,39 @@ export const BrandSignature: React.FC<BrandSignatureProps> = ({ isDark = false }
 				marginBottom: "18px",
 			}}
 		>
-			{/* Left: Brand Monogram + Wordmark */}
+			{/* Left: Authentic Brand Monogram + Wordmark Lockup */}
 			<div style={{ display: "flex", flexDirection: "row", alignItems: "center" }}>
-				{getLbMonogramSvg(monogramColor, 44)}
-				<div style={{ display: "flex", flexDirection: "column", marginLeft: "14px" }}>
-					<div style={{ display: "flex", flexDirection: "row", alignItems: "baseline" }}>
-						<span
-							style={{
-								fontFamily: TYPOGRAPHY.fontFamily,
-								fontSize: "24px",
-								fontWeight: TYPOGRAPHY.weights.bold,
-								color: textColor,
-								letterSpacing: "-0.5px",
-							}}
-						>
-							Law
-						</span>
-						<span
-							style={{
-								fontFamily: TYPOGRAPHY.fontFamily,
-								fontSize: "24px",
-								fontWeight: TYPOGRAPHY.weights.bold,
-								color: tagColor,
-								letterSpacing: "-0.5px",
-							}}
-						>
-							Briefly
-						</span>
-					</div>
-					<span
-						style={{
-							fontFamily: TYPOGRAPHY.fontFamily,
-							fontSize: "12px",
-							fontWeight: TYPOGRAPHY.weights.bold,
-							color: isDark ? COLORS.textLightMuted : COLORS.textDarkMuted,
-							letterSpacing: "1px",
-							textTransform: "uppercase",
-							marginTop: "2px",
-						}}
-					>
-						Indian Legal Media & Analysis
-					</span>
-				</div>
+				<img
+					src={getLawBrieflyLogoDataUrl(isDark)}
+					alt="LawBriefly"
+					width={140}
+					height={45}
+					style={{
+						width: "140px",
+						height: "45px",
+					}}
+				/>
+				<div
+					style={{
+						width: "1.5px",
+						height: "30px",
+						backgroundColor: isDark ? "rgba(255, 255, 255, 0.2)" : "rgba(11, 37, 69, 0.2)",
+						marginLeft: "18px",
+						marginRight: "18px",
+					}}
+				/>
+				<span
+					style={{
+						fontFamily: TYPOGRAPHY.fontFamily,
+						fontSize: "12px",
+						fontWeight: TYPOGRAPHY.weights.bold,
+						color: isDark ? COLORS.textLightMuted : COLORS.textDarkMuted,
+						letterSpacing: "1px",
+						textTransform: "uppercase",
+					}}
+				>
+					Indian Legal Media & Analysis
+				</span>
 			</div>
 
 			{/* Right: Official Tagline Pill */}

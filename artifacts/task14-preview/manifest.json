@@ -1,5 +1,5 @@
 {
-  "rendered_at": "2026-11-02T01:31:03.038Z",
+  "rendered_at": "2026-11-02T02:02:58.605Z",
   "total_slides": 5,
   "dimensions": "1080x1350",
   "primary_category": "tax_law",
@@ -13,7 +13,7 @@
         "width": 1080,
         "height": 1350
       },
-      "size_bytes": 335529
+      "size_bytes": 337089
     },
     {
       "slide_number": 2,
@@ -23,7 +23,7 @@
         "width": 1080,
         "height": 1350
       },
-      "size_bytes": 167883
+      "size_bytes": 169403
     },
     {
       "slide_number": 3,
@@ -33,7 +33,7 @@
         "width": 1080,
         "height": 1350
       },
-      "size_bytes": 158003
+      "size_bytes": 159253
     },
     {
       "slide_number": 4,
@@ -43,7 +43,7 @@
         "width": 1080,
         "height": 1350
       },
-      "size_bytes": 290044
+      "size_bytes": 292309
     },
     {
       "slide_number": 5,
@@ -53,7 +53,7 @@
         "width": 1080,
         "height": 1350
       },
-      "size_bytes": 138183
+      "size_bytes": 141321
     }
   ]
 }

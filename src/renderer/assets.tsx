@@ -65,6 +65,28 @@ export function getBrandAssetDataUrl(filename: string, baseDir = process.cwd()):
 	return `data:${mime};base64,${buf.toString("base64")}`;
 }
 
+import {
+	LB_HORIZONTAL_DARK_DATA_URL,
+	LB_HORIZONTAL_WHITE_DATA_URL,
+	LB_MONOGRAM_DARK_DATA_URL,
+	LB_MONOGRAM_WHITE_DATA_URL,
+} from "./brand-data";
+
+/**
+ * Returns the base64 Data URL for the authentic horizontal LawBriefly logo lockup.
+ * Uses the exact brand asset with original font and unified color (crisp white for dark backgrounds, solid dark for light backgrounds).
+ */
+export function getLawBrieflyLogoDataUrl(isDark = false): string {
+	return isDark ? LB_HORIZONTAL_WHITE_DATA_URL : LB_HORIZONTAL_DARK_DATA_URL;
+}
+
+/**
+ * Returns the base64 Data URL for the authentic standalone LB monogram.
+ */
+export function getLawBrieflyMonogramDataUrl(isDark = false): string {
+	return isDark ? LB_MONOGRAM_WHITE_DATA_URL : LB_MONOGRAM_DARK_DATA_URL;
+}
+
 /**
  * Crisp Vector SVG of LawBriefly LB Monogram
  * Based on the authoritative brand monogram:
