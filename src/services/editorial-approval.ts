@@ -19,6 +19,7 @@ import {
 	answerCallbackQuery,
 	escapeTelegramHtml,
 	timingSafeEqualStrings,
+	normalizeBotToken,
 	type TelegramUpdate,
 	type TelegramMediaItem,
 } from "./telegram-bot";
@@ -85,19 +86,35 @@ export function getValidatedTelegramEnv(env: Env): {
 	if (!env.TELEGRAM_BOT_TOKEN || env.TELEGRAM_BOT_TOKEN.trim().length === 0) {
 		throw new Error("TELEGRAM_BOT_TOKEN is not configured in environment.");
 	}
+	const normalizedBotToken = normalizeBotToken(env.TELEGRAM_BOT_TOKEN);
+	if (!normalizedBotToken) {
+		throw new Error("TELEGRAM_BOT_TOKEN is invalid or empty after normalization.");
+	}
+
 	if (!env.TELEGRAM_CHAT_ID || env.TELEGRAM_CHAT_ID.trim().length === 0) {
 		throw new Error("TELEGRAM_CHAT_ID is not configured in environment.");
 	}
+	const normalizedChatId = env.TELEGRAM_CHAT_ID.trim().replace(/^["']+|["']+$/g, "").trim();
+	if (!normalizedChatId) {
+		throw new Error("TELEGRAM_CHAT_ID is empty after normalization.");
+	}
+
 	if (!env.TELEGRAM_ALLOWED_USER_IDS || env.TELEGRAM_ALLOWED_USER_IDS.trim().length === 0) {
 		throw new Error("TELEGRAM_ALLOWED_USER_IDS is not configured in environment.");
 	}
+	const cleanedAllowedUsersRaw = env.TELEGRAM_ALLOWED_USER_IDS.trim().replace(/^["']+|["']+$/g, "").trim();
+
 	if (!env.TELEGRAM_WEBHOOK_SECRET || env.TELEGRAM_WEBHOOK_SECRET.trim().length === 0) {
 		throw new Error("TELEGRAM_WEBHOOK_SECRET is not configured in environment.");
 	}
+	const normalizedWebhookSecret = env.TELEGRAM_WEBHOOK_SECRET.trim().replace(/^["']+|["']+$/g, "").trim();
+	if (!normalizedWebhookSecret) {
+		throw new Error("TELEGRAM_WEBHOOK_SECRET is empty after normalization.");
+	}
 
 	const allowedUserIds = new Set(
-		env.TELEGRAM_ALLOWED_USER_IDS.split(",")
-			.map((id) => id.trim())
+		cleanedAllowedUsersRaw.split(",")
+			.map((id) => id.trim().replace(/^["']+|["']+$/g, "").trim())
 			.filter((id) => id.length > 0)
 	);
 
@@ -107,17 +124,17 @@ export function getValidatedTelegramEnv(env: Env): {
 
 	let ttlHours = DEFAULT_APPROVAL_TTL_HOURS;
 	if (env.TELEGRAM_APPROVAL_TTL_HOURS) {
-		const parsed = parseInt(env.TELEGRAM_APPROVAL_TTL_HOURS, 10);
+		const parsed = parseInt(String(env.TELEGRAM_APPROVAL_TTL_HOURS).trim().replace(/^["']+|["']+$/g, "").trim(), 10);
 		if (!isNaN(parsed) && parsed > 0) {
 			ttlHours = parsed;
 		}
 	}
 
 	return {
-		botToken: env.TELEGRAM_BOT_TOKEN.trim(),
-		chatId: env.TELEGRAM_CHAT_ID.trim(),
+		botToken: normalizedBotToken,
+		chatId: normalizedChatId,
 		allowedUserIds,
-		webhookSecret: env.TELEGRAM_WEBHOOK_SECRET.trim(),
+		webhookSecret: normalizedWebhookSecret,
 		ttlHours,
 	};
 }

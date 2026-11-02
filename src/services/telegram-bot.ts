@@ -81,6 +81,37 @@ export function escapeTelegramHtml(text: string): string {
 }
 
 /**
+ * Normalizes a Telegram bot token:
+ * - Trims whitespace and carriage returns
+ * - Strips surrounding double or single quotes
+ * - Strips redundant leading "bot" prefix (case-insensitive) if accidentally provided
+ */
+export function normalizeBotToken(token: string): string {
+	if (!token) return "";
+	let cleaned = token.trim();
+	// Strip surrounding double or single quotes
+	cleaned = cleaned.replace(/^["']+|["']+$/g, "").trim();
+	// Strip redundant leading "bot" or "BOT" prefix if accidentally included
+	if (cleaned.toLowerCase().startsWith("bot")) {
+		cleaned = cleaned.slice(3);
+	}
+	return cleaned.trim();
+}
+
+/**
+ * Builds the canonical Telegram Bot API URL for a given method.
+ * Guaranteed format: https://api.telegram.org/bot<TOKEN>/<method>
+ */
+export function buildTelegramApiUrl(botToken: string, method: string): string {
+	const normalized = normalizeBotToken(botToken);
+	if (!normalized) {
+		throw new Error("TELEGRAM_BOT_TOKEN is missing or empty.");
+	}
+	const cleanMethod = method.replace(/^\/+|\/+$/g, "");
+	return `${TELEGRAM_API_BASE}${normalized}/${cleanMethod}`;
+}
+
+/**
  * Redacts bot tokens from error messages and string representations to prevent credential leaks.
  */
 export function sanitizeTelegramError(error: unknown, botToken?: string): string {
@@ -88,7 +119,12 @@ export function sanitizeTelegramError(error: unknown, botToken?: string): string
 	if (!botToken || botToken.trim().length === 0) {
 		return rawMessage;
 	}
-	return rawMessage.split(botToken).join("[REDACTED_BOT_TOKEN]");
+	const normalized = normalizeBotToken(botToken);
+	let sanitized = rawMessage.split(botToken).join("[REDACTED_BOT_TOKEN]");
+	if (normalized && normalized !== botToken) {
+		sanitized = sanitized.split(normalized).join("[REDACTED_BOT_TOKEN]");
+	}
+	return sanitized;
 }
 
 export const CONSTANT_TIME_BOUND_BYTES = 256;
@@ -140,7 +176,8 @@ export async function sendMediaGroup(
 	chatId: string | number,
 	mediaItems: TelegramMediaItem[]
 ): Promise<{ message_ids: number[] }> {
-	if (!botToken || botToken.trim().length === 0) {
+	const normalizedToken = normalizeBotToken(botToken);
+	if (!normalizedToken) {
 		throw new Error("TELEGRAM_BOT_TOKEN is missing or empty.");
 	}
 	if (!chatId) {
@@ -150,7 +187,7 @@ export async function sendMediaGroup(
 		throw new Error(`sendMediaGroup requires between 2 and 10 media items (received ${mediaItems?.length || 0}).`);
 	}
 
-	const url = `${TELEGRAM_API_BASE}${botToken}/sendMediaGroup`;
+	const url = buildTelegramApiUrl(botToken, "sendMediaGroup");
 	const formData = new FormData();
 	formData.append("chat_id", String(chatId));
 
@@ -204,7 +241,11 @@ export async function sendMediaGroup(
 
 		if (!response.ok || !data.ok) {
 			const errDesc = data.description || `HTTP ${response.status}`;
-			throw new Error(`Telegram sendMediaGroup failed (${data.error_code || response.status}): ${errDesc}`);
+			const is404 = (data.error_code || response.status) === 404;
+			const safeDiagnostic = is404
+				? ` [Safe diagnostics: endpoint=sendMediaGroup, token_present=${Boolean(botToken)}, token_length=${normalizedToken.length}, token_format_valid=${/^\d+:[A-Za-z0-9_-]+$/.test(normalizedToken)}, url_path=${url.replace(normalizedToken, "[REDACTED]")}]`
+				: "";
+			throw new Error(`Telegram sendMediaGroup failed (${data.error_code || response.status}): ${errDesc}${safeDiagnostic}`);
 		}
 
 		if (!Array.isArray(data.result)) {
@@ -237,7 +278,7 @@ export async function sendMessage(
 		throw new Error("TELEGRAM_CHAT_ID is missing or empty.");
 	}
 
-	const url = `${TELEGRAM_API_BASE}${botToken}/sendMessage`;
+	const url = buildTelegramApiUrl(botToken, "sendMessage");
 	const payload: any = {
 		chat_id: String(chatId),
 		text,
@@ -269,7 +310,12 @@ export async function sendMessage(
 
 		if (!response.ok || !data.ok) {
 			const errDesc = data.description || `HTTP ${response.status}`;
-			throw new Error(`Telegram sendMessage failed (${data.error_code || response.status}): ${errDesc}`);
+			const is404 = (data.error_code || response.status) === 404;
+			const normalizedToken = normalizeBotToken(botToken);
+			const safeDiagnostic = is404
+				? ` [Safe diagnostics: endpoint=sendMessage, token_present=${Boolean(botToken)}, token_length=${normalizedToken.length}, token_format_valid=${/^\d+:[A-Za-z0-9_-]+$/.test(normalizedToken)}, url_path=${url.replace(normalizedToken, "[REDACTED]")}]`
+				: "";
+			throw new Error(`Telegram sendMessage failed (${data.error_code || response.status}): ${errDesc}${safeDiagnostic}`);
 		}
 
 		if (!data.result || typeof data.result.message_id !== "number") {
@@ -299,7 +345,7 @@ export async function editMessageText(
 		throw new Error("TELEGRAM_BOT_TOKEN is missing or empty.");
 	}
 
-	const url = `${TELEGRAM_API_BASE}${botToken}/editMessageText`;
+	const url = buildTelegramApiUrl(botToken, "editMessageText");
 	const payload: any = {
 		chat_id: String(chatId),
 		message_id: messageId,
@@ -353,7 +399,7 @@ export async function editMessageReplyMarkup(
 		throw new Error("TELEGRAM_BOT_TOKEN is missing or empty.");
 	}
 
-	const url = `${TELEGRAM_API_BASE}${botToken}/editMessageReplyMarkup`;
+	const url = buildTelegramApiUrl(botToken, "editMessageReplyMarkup");
 	const payload = {
 		chat_id: String(chatId),
 		message_id: messageId,
@@ -405,7 +451,7 @@ export async function answerCallbackQuery(
 		throw new Error("callback_query_id is required.");
 	}
 
-	const url = `${TELEGRAM_API_BASE}${botToken}/answerCallbackQuery`;
+	const url = buildTelegramApiUrl(botToken, "answerCallbackQuery");
 	const payload: any = {
 		callback_query_id: callbackQueryId,
 	};

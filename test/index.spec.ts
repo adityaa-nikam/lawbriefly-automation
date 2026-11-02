@@ -115,6 +115,8 @@ import {
 	escapeTelegramHtml,
 	sanitizeTelegramError,
 	timingSafeEqualStrings,
+	normalizeBotToken,
+	buildTelegramApiUrl,
 	type TelegramUpdate,
 } from "../src/services/telegram-bot";
 import {
@@ -12140,6 +12142,190 @@ describe("Task 10 - Global Hot Legal Topic Selection Using Groq", () => {
 					];
 
 					expect(expectedSnippets.length).toBe(7);
+				});
+
+				it("51. normalizeBotToken strips quotes, whitespace, CRLF, and accidental bot-prefix", () => {
+					expect(normalizeBotToken("123456789:ABCdef-ghijk_lmn")).toBe("123456789:ABCdef-ghijk_lmn");
+					expect(normalizeBotToken("\"123456789:ABCdef-ghijk_lmn\"")).toBe("123456789:ABCdef-ghijk_lmn");
+					expect(normalizeBotToken("'123456789:ABCdef-ghijk_lmn'")).toBe("123456789:ABCdef-ghijk_lmn");
+					expect(normalizeBotToken("  \"123456789:ABCdef-ghijk_lmn\" \r\n")).toBe("123456789:ABCdef-ghijk_lmn");
+					expect(normalizeBotToken("bot123456789:ABCdef-ghijk_lmn")).toBe("123456789:ABCdef-ghijk_lmn");
+					expect(normalizeBotToken("BOT123456789:ABCdef-ghijk_lmn")).toBe("123456789:ABCdef-ghijk_lmn");
+					expect(normalizeBotToken(" \"bot123456789:ABCdef-ghijk_lmn\" ")).toBe("123456789:ABCdef-ghijk_lmn");
+					expect(normalizeBotToken("")).toBe("");
+				});
+
+				it("52. buildTelegramApiUrl generates canonical Telegram Bot API URL without duplicates or missing slashes", () => {
+					const normalUrl = buildTelegramApiUrl("123456789:ABCdef-ghijk_lmn", "sendMediaGroup");
+					expect(normalUrl).toBe("https://api.telegram.org/bot123456789:ABCdef-ghijk_lmn/sendMediaGroup");
+
+					const slashUrl = buildTelegramApiUrl("123456789:ABCdef-ghijk_lmn", "/sendMediaGroup/");
+					expect(slashUrl).toBe("https://api.telegram.org/bot123456789:ABCdef-ghijk_lmn/sendMediaGroup");
+
+					const sendMsgUrl = buildTelegramApiUrl("123456789:ABCdef-ghijk_lmn", "sendMessage");
+					expect(sendMsgUrl).toBe("https://api.telegram.org/bot123456789:ABCdef-ghijk_lmn/sendMessage");
+
+					// Handles quoted / prefixed token seamlessly without duplicate /botbot
+					const quotedUrl = buildTelegramApiUrl("\"bot123456789:ABCdef-ghijk_lmn\"", "sendMediaGroup");
+					expect(quotedUrl).toBe("https://api.telegram.org/bot123456789:ABCdef-ghijk_lmn/sendMediaGroup");
+
+					expect(() => buildTelegramApiUrl("", "sendMediaGroup")).toThrow("TELEGRAM_BOT_TOKEN is missing or empty.");
+				});
+
+				it("53. sendMediaGroup asserts exact POST request method, canonical URL, and media group result", async () => {
+					let capturedUrl = "";
+					let capturedMethod = "";
+					let capturedFormData: FormData | null = null;
+
+					vi.spyOn(globalThis, "fetch").mockImplementationOnce(async (input: any, init: any) => {
+						capturedUrl = typeof input === "string" ? input : input.url;
+						capturedMethod = init?.method || "GET";
+						capturedFormData = init?.body as FormData;
+
+						return new Response(
+							JSON.stringify({
+								ok: true,
+								result: [
+									{ message_id: 301 },
+									{ message_id: 302 },
+								],
+							}),
+							{
+								status: 200,
+								headers: { "Content-Type": "application/json" },
+							}
+						);
+					});
+
+					const dummyMedia = [
+						{ filename: "slide-01.png", bytes: new Uint8Array([137, 80, 78, 71]) },
+						{ filename: "slide-02.png", bytes: new Uint8Array([137, 80, 78, 71]) },
+					];
+
+					const res = await sendMediaGroup("123456789:ABCdef-ghijk_lmn", "-1001234567890", dummyMedia);
+					expect(capturedUrl).toBe("https://api.telegram.org/bot123456789:ABCdef-ghijk_lmn/sendMediaGroup");
+					expect(capturedMethod).toBe("POST");
+					expect(capturedFormData).toBeInstanceOf(FormData);
+					expect(res.message_ids).toEqual([301, 302]);
+				});
+
+				it("54. sendMessage asserts exact POST request method, canonical URL, and message_id result", async () => {
+					let capturedUrl = "";
+					let capturedMethod = "";
+					let capturedBody: any = null;
+
+					vi.spyOn(globalThis, "fetch").mockImplementationOnce(async (input: any, init: any) => {
+						capturedUrl = typeof input === "string" ? input : input.url;
+						capturedMethod = init?.method || "GET";
+						capturedBody = JSON.parse(init?.body as string);
+
+						return new Response(
+							JSON.stringify({
+								ok: true,
+								result: { message_id: 401 },
+							}),
+							{
+								status: 200,
+								headers: { "Content-Type": "application/json" },
+							}
+						);
+					});
+
+					const res = await sendMessage("123456789:ABCdef-ghijk_lmn", "-1001234567890", "Hello Editor", {
+						parse_mode: "HTML",
+					});
+
+					expect(capturedUrl).toBe("https://api.telegram.org/bot123456789:ABCdef-ghijk_lmn/sendMessage");
+					expect(capturedMethod).toBe("POST");
+					expect(capturedBody.text).toBe("Hello Editor");
+					expect(capturedBody.parse_mode).toBe("HTML");
+					expect(res.message_id).toBe(401);
+				});
+
+				it("55. sendMediaGroup and sendMessage preserve Telegram error description and include safe diagnostics on 404 without leaking token", async () => {
+					const mockSecretToken = "987654321:SECRET_TOKEN_VALUE_XYZ";
+
+					// Test sendMediaGroup 404
+					vi.spyOn(globalThis, "fetch").mockImplementationOnce(async () => {
+						return new Response(
+							JSON.stringify({
+								ok: false,
+								error_code: 404,
+								description: "Not Found",
+							}),
+							{
+								status: 404,
+								headers: { "Content-Type": "application/json" },
+							}
+						);
+					});
+
+					const dummyMedia = [
+						{ filename: "slide-01.png", bytes: new Uint8Array([137, 80, 78, 71]) },
+						{ filename: "slide-02.png", bytes: new Uint8Array([137, 80, 78, 71]) },
+					];
+
+					let caughtMediaError: Error | null = null;
+					try {
+						await sendMediaGroup(mockSecretToken, "-1001234567890", dummyMedia);
+					} catch (e: any) {
+						caughtMediaError = e;
+					}
+
+					expect(caughtMediaError).not.toBeNull();
+					expect(caughtMediaError?.message).toContain("Telegram sendMediaGroup failed (404): Not Found");
+					expect(caughtMediaError?.message).toContain("[Safe diagnostics: endpoint=sendMediaGroup, token_present=true");
+					expect(caughtMediaError?.message).toContain("token_format_valid=true");
+					expect(caughtMediaError?.message).toContain("url_path=https://api.telegram.org/bot[REDACTED]/sendMediaGroup");
+					// Strict check: raw secret token must NEVER appear anywhere in the error message
+					expect(caughtMediaError?.message.includes(mockSecretToken)).toBe(false);
+
+					// Test sendMessage 404
+					vi.spyOn(globalThis, "fetch").mockImplementationOnce(async () => {
+						return new Response(
+							JSON.stringify({
+								ok: false,
+								error_code: 404,
+								description: "Not Found",
+							}),
+							{
+								status: 404,
+								headers: { "Content-Type": "application/json" },
+							}
+						);
+					});
+
+					let caughtMsgError: Error | null = null;
+					try {
+						await sendMessage(mockSecretToken, "-1001234567890", "Test message");
+					} catch (e: any) {
+						caughtMsgError = e;
+					}
+
+					expect(caughtMsgError).not.toBeNull();
+					expect(caughtMsgError?.message).toContain("Telegram sendMessage failed (404): Not Found");
+					expect(caughtMsgError?.message).toContain("[Safe diagnostics: endpoint=sendMessage, token_present=true");
+					expect(caughtMsgError?.message).toContain("token_format_valid=true");
+					expect(caughtMsgError?.message.includes(mockSecretToken)).toBe(false);
+				});
+
+				it("56. getValidatedTelegramEnv normalizes quoted and padded environment variables", () => {
+					const quotedEnv: Env = {
+						...mockTelegramDevEnv,
+						TELEGRAM_BOT_TOKEN: "  \"123456789:ABCdef-ghijk_lmn\" \r\n",
+						TELEGRAM_CHAT_ID: " \"1405876915\" \n",
+						TELEGRAM_ALLOWED_USER_IDS: " \"1405876915\", '987654321' ",
+						TELEGRAM_WEBHOOK_SECRET: " \"my_secret_token_val\" ",
+						TELEGRAM_APPROVAL_TTL_HOURS: " \"48\" ",
+					};
+
+					const validated = getValidatedTelegramEnv(quotedEnv);
+					expect(validated.botToken).toBe("123456789:ABCdef-ghijk_lmn");
+					expect(validated.chatId).toBe("1405876915");
+					expect(validated.allowedUserIds.has("1405876915")).toBe(true);
+					expect(validated.allowedUserIds.has("987654321")).toBe(true);
+					expect(validated.webhookSecret).toBe("my_secret_token_val");
+					expect(validated.ttlHours).toBe(48);
 				});
 			});
 		});
