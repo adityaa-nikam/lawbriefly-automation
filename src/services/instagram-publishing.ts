@@ -255,7 +255,7 @@ export function getValidatedInstagramConfig(env: Env): InstagramPublishingConfig
 			: FACEBOOK_LOGIN_API_BASE_URL;
 
 	const accessToken = (env.INSTAGRAM_ACCESS_TOKEN || "").trim();
-	const accountId = (env.INSTAGRAM_ACCOUNT_ID || "").trim();
+	const accountId = (env.INSTAGRAM_USER_ID || env.INSTAGRAM_ACCOUNT_ID || "").trim();
 	const graphVersion = (env.INSTAGRAM_GRAPH_VERSION || DEFAULT_INSTAGRAM_GRAPH_VERSION).trim();
 
 	if (!accessToken) {
@@ -263,7 +263,7 @@ export function getValidatedInstagramConfig(env: Env): InstagramPublishingConfig
 	}
 
 	if (!accountId) {
-		throw new Error("Missing required Worker secret: INSTAGRAM_ACCOUNT_ID");
+		throw new Error("Missing required Worker secret: INSTAGRAM_ACCOUNT_ID or INSTAGRAM_USER_ID");
 	}
 
 	return {
@@ -305,9 +305,13 @@ export async function verifyInstagramCredentials(
 }> {
 	try {
 		const config = getValidatedInstagramConfig(env);
+		const path =
+			config.authMode === "instagram_login"
+				? "me?fields=user_id,username"
+				: `${config.accountId}?fields=id,username,name`;
 		const url = buildGraphApiUrl(
 			config.graphVersion,
-			`${config.accountId}?fields=id,username,name`,
+			path,
 			config.apiBaseUrl
 		);
 
@@ -327,9 +331,25 @@ export async function verifyInstagramCredentials(
 		}
 
 		const data: any = await response.json();
+		const resolvedAccountId = data.user_id || data.id || config.accountId;
+
+		if (config.authMode === "instagram_login" && (data.user_id || data.id)) {
+			const returnedId = String(data.user_id || data.id);
+			if (returnedId !== config.accountId) {
+				return {
+					valid: false,
+					account_id: returnedId,
+					username: data.username,
+					login_type: config.authMode,
+					api_host: config.apiBaseUrl,
+					error: `Instagram Account ID mismatch: authenticated token belongs to user ${returnedId}, but INSTAGRAM_ACCOUNT_ID is configured as ${config.accountId}`,
+				};
+			}
+		}
+
 		return {
 			valid: true,
-			account_id: data.id || config.accountId,
+			account_id: resolvedAccountId,
 			username: data.username || data.name || "lawbriefly",
 			login_type: config.authMode,
 			api_host: config.apiBaseUrl,
@@ -711,6 +731,51 @@ export async function createCarouselItemContainer(
 }
 
 /**
+ * Creates a single image container in Meta Instagram Graph API.
+ * Endpoint: POST /{ig_user_id}/media with image_url and caption.
+ */
+export async function createSingleImageContainer(
+	config: InstagramPublishingConfig,
+	imageUrl: string,
+	caption?: string
+): Promise<string> {
+	if (!imageUrl || !imageUrl.startsWith("https://")) {
+		throw new Error("Invalid image_url: must be a valid HTTPS URL.");
+	}
+
+	const url = buildGraphApiUrl(config.graphVersion, `${config.accountId}/media`, config.apiBaseUrl);
+
+	const payload: Record<string, any> = {
+		image_url: imageUrl,
+	};
+	if (caption && caption.trim().length > 0) {
+		payload.caption = caption.trim();
+	}
+
+	const response = await fetch(url, {
+		method: "POST",
+		headers: {
+			Authorization: `Bearer ${config.accessToken}`,
+			"Content-Type": "application/json",
+		},
+		body: JSON.stringify(payload),
+	});
+
+	if (!response.ok) {
+		const errorData: any = await response.json().catch(() => ({}));
+		const errorMsg = sanitizeMetaError(errorData?.error || response.statusText);
+		throw new Error(`Failed to create single image container (${response.status}): ${errorMsg}`);
+	}
+
+	const data: any = await response.json();
+	if (!data.id) {
+		throw new Error("Meta Graph API returned single image container response missing ID.");
+	}
+
+	return data.id;
+}
+
+/**
  * Creates the parent carousel container grouping child container IDs and applying the post caption.
  * Endpoint: POST /{ig_user_id}/media with media_type = CAROUSEL, children, and caption.
  */
@@ -984,9 +1049,245 @@ export async function publishApprovedCarousel(
 	};
 }
 
+export interface PublishSingleImageOptions {
+	prepareOnly?: boolean;
+	dryRun?: boolean; // legacy alias for prepareOnly
+	customConverter?: (pngBytes: Uint8Array, slideNumber?: number) => Promise<Uint8Array>;
+	pollMaxAttempts?: number;
+	pollIntervalMs?: number;
+}
+
+export interface PublishSingleImageParams {
+	postId?: string;
+	storagePath?: string;
+	caption?: string;
+	options?: PublishSingleImageOptions;
+}
+
+export interface PublishSingleImageResult {
+	success: boolean;
+	prepare_only: boolean;
+	dry_run: boolean;
+	post_id?: string;
+	container_id?: string;
+	instagram_media_id?: string;
+	instagram_permalink?: string;
+	image_url?: string;
+	storage_path?: string;
+	error?: string;
+	error_code?: string;
+}
+
+/**
+ * Complete publishing orchestrator for single images stored in Supabase Storage.
+ *
+ * Workflow:
+ * 1. Retrieve the image from Supabase Storage (either from an approved post's slide or via direct storage path).
+ * 2. Validate/convert to JPEG format (1080x1350, <8MB, JPEG magic bytes).
+ * 3. Generate a temporary signed HTTPS URL (60-minute TTL, direct JPEG, accessible to Meta crawler without auth headers).
+ * 4. Create the Instagram single-image container: POST /{ig_user_id}/media with image_url & caption.
+ * 5. Poll container status until ready (FINISHED).
+ * 6. If prepareOnly is true (default): stops safely without calling media_publish.
+ * 7. If prepareOnly is false: publishes container via media_publish, retrieves permalink, updates Supabase status.
+ */
+export async function publishSingleImage(
+	env: Env,
+	params: PublishSingleImageParams
+): Promise<PublishSingleImageResult> {
+	const prepareOnly = params.options?.prepareOnly ?? params.options?.dryRun ?? true;
+	const config = getValidatedInstagramConfig(env);
+	const supabase = getSupabaseClient(env);
+
+	let storagePath: string;
+	let caption: string;
+	let post: any = null;
+
+	if (params.postId) {
+		// 1. Retrieve post from Supabase
+		const { data: postRecord, error: postError } = await supabase
+			.from("social_content_posts")
+			.select("*")
+			.eq("id", params.postId)
+			.single();
+
+		if (postError || !postRecord) {
+			throw new Error(`Post not found in database: ${params.postId}`);
+		}
+
+		post = postRecord;
+
+		// Validate post eligibility (prevent duplicate publishing)
+		if (post.post_status === "published") {
+			return {
+				success: false,
+				prepare_only: prepareOnly,
+				dry_run: prepareOnly,
+				post_id: params.postId,
+				error: "Post has already been published to Instagram. Republishing is prohibited.",
+				error_code: "POST_ALREADY_PUBLISHED",
+			};
+		}
+
+		if (post.post_status === "publishing") {
+			return {
+				success: false,
+				prepare_only: prepareOnly,
+				dry_run: prepareOnly,
+				post_id: params.postId,
+				error: "Publishing is currently in progress for this post.",
+				error_code: "PUBLISHING_IN_PROGRESS",
+			};
+		}
+
+		if (post.post_status !== "approved") {
+			return {
+				success: false,
+				prepare_only: prepareOnly,
+				dry_run: prepareOnly,
+				post_id: params.postId,
+				error: `Post status must be 'approved' to publish. Current status: '${post.post_status}'.`,
+				error_code: "POST_NOT_APPROVED",
+			};
+		}
+
+		// Retrieve primary slide asset (slide 1)
+		const { data: assets, error: assetError } = await supabase
+			.from("social_content_assets")
+			.select("*")
+			.eq("post_id", params.postId)
+			.eq("asset_type", "slide")
+			.order("slide_number", { ascending: true });
+
+		if (assetError || !assets || assets.length === 0) {
+			throw new Error(`No slide asset found for post ${params.postId}`);
+		}
+
+		const primaryAsset = assets[0];
+
+		// Download asset from Supabase Storage
+		const { data: blob, error: downloadError } = await supabase.storage
+			.from(primaryAsset.storage_bucket || CAROUSEL_STORAGE_BUCKET)
+			.download(primaryAsset.storage_path);
+
+		if (downloadError || !blob) {
+			throw new Error(`Failed to download slide from storage: ${downloadError?.message}`);
+		}
+
+		const rawBytes = new Uint8Array(await blob.arrayBuffer());
+
+		// Check if already JPEG or convert from PNG
+		let jpegBytes: Uint8Array;
+		if (isValidJpegBuffer(rawBytes)) {
+			jpegBytes = rawBytes;
+		} else if (params.options?.customConverter) {
+			jpegBytes = await params.options.customConverter(rawBytes, 1);
+		} else {
+			jpegBytes = await convertPngToJpegWithBrowser(rawBytes, env);
+		}
+
+		const validation = validateJpegSlide(jpegBytes, 1);
+		if (!validation.valid) {
+			throw new Error(`JPEG validation failed: ${validation.error}`);
+		}
+
+		// Upload JPEG publishing asset
+		const jpegPath = `posts/${params.postId}/publishing/single-image.jpg`;
+		const { error: uploadError } = await supabase.storage
+			.from(CAROUSEL_STORAGE_BUCKET)
+			.upload(jpegPath, jpegBytes, {
+				contentType: "image/jpeg",
+				upsert: true,
+			});
+
+		if (uploadError) {
+			throw new Error(`Failed to upload JPEG publishing asset: ${uploadError.message}`);
+		}
+
+		storagePath = jpegPath;
+
+		// Format caption with hashtags
+		const hashtags = Array.isArray(post.hashtags) ? post.hashtags : [];
+		const hashtagString = hashtags.length > 0
+			? "\n\n" + hashtags.map((h: string) => (h.startsWith("#") ? h : `#${h}`)).join(" ")
+			: "";
+		caption = `${post.instagram_caption || ""}${hashtagString}`.trim();
+	} else if (params.storagePath) {
+		storagePath = params.storagePath.trim();
+		caption = (params.caption || "").trim();
+	} else {
+		throw new Error("Either 'postId' or 'storagePath' must be provided to publishSingleImage.");
+	}
+
+	// 2. Generate temporary signed HTTPS URL (60-minute TTL)
+	const { data: signedData, error: signError } = await supabase.storage
+		.from(CAROUSEL_STORAGE_BUCKET)
+		.createSignedUrl(storagePath, SIGNED_URL_PUBLISH_EXPIRY_SECONDS);
+
+	if (signError || !signedData?.signedUrl) {
+		throw new Error(`Failed to generate signed URL for ${storagePath}: ${signError?.message}`);
+	}
+
+	const signedUrl = signedData.signedUrl;
+
+	// 3. Create Instagram single-image container
+	const containerId = await createSingleImageContainer(config, signedUrl, caption);
+
+	// 4. Poll container status until ready (FINISHED)
+	const containerStatus = await pollContainerUntilReady(config, containerId, {
+		maxAttempts: params.options?.pollMaxAttempts,
+		intervalMs: params.options?.pollIntervalMs,
+	});
+
+	if (containerStatus.status_code !== "FINISHED") {
+		throw new Error(`Single image container processing did not finish successfully: ${containerStatus.status_code}`);
+	}
+
+	// 5. If prepare_only (default), safely return without publishing
+	if (prepareOnly) {
+		return {
+			success: true,
+			prepare_only: true,
+			dry_run: true,
+			post_id: params.postId,
+			container_id: containerId,
+			image_url: signedUrl,
+			storage_path: storagePath,
+		};
+	}
+
+	// 6. Live publishing (media_publish)
+	const mediaId = await publishMediaContainer(config, containerId);
+	const mediaDetails = await getPublishedMediaDetails(config, mediaId);
+
+	// 7. Update post status in database if postId is present
+	if (params.postId) {
+		const now = new Date().toISOString();
+		await supabase
+			.from("social_content_posts")
+			.update({
+				post_status: "published",
+				updated_at: now,
+			})
+			.eq("id", params.postId);
+	}
+
+	return {
+		success: true,
+		prepare_only: false,
+		dry_run: false,
+		post_id: params.postId,
+		container_id: containerId,
+		instagram_media_id: mediaId,
+		instagram_permalink: mediaDetails.permalink,
+		image_url: signedUrl,
+		storage_path: storagePath,
+	};
+}
+
 /**
  * Handles POST /api/ai/publish-instagram endpoint.
  * Gated: development-only. Default prepare_only: true.
+ * Supports both single image (media_type: "IMAGE") and carousel (default / media_type: "CAROUSEL") publishing.
  */
 export async function handlePublishInstagram(request: Request, env: Env): Promise<Response> {
 	if (env.APP_ENV !== "development") {
@@ -1022,26 +1323,49 @@ export async function handlePublishInstagram(request: Request, env: Env): Promis
 	}
 
 	const postId = typeof body?.post_id === "string" ? body.post_id.trim() : "";
-	if (!postId || !/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(postId)) {
+	const storagePath = typeof body?.storage_path === "string" ? body.storage_path.trim() : "";
+	const mediaType = String(body?.media_type || (storagePath && !postId ? "IMAGE" : "CAROUSEL")).toUpperCase();
+
+	if (!postId && !storagePath) {
+		return new Response(
+			JSON.stringify({ error: "Bad Request", message: "Valid 'post_id' UUID or 'storage_path' is required." }),
+			{ status: 400, headers: { "Content-Type": "application/json" } }
+		);
+	}
+
+	if (postId && !/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(postId)) {
 		return new Response(
 			JSON.stringify({ error: "Bad Request", message: "Valid 'post_id' UUID is required." }),
 			{ status: 400, headers: { "Content-Type": "application/json" } }
 		);
 	}
 
-	// In Task 17A, prepare_only defaults to true (never publishes)
+	// prepare_only defaults to true (never publishes without explicit false)
 	const prepareOnly = body?.prepare_only !== undefined
 		? Boolean(body.prepare_only)
 		: (body?.dry_run !== undefined ? Boolean(body.dry_run) : true);
 
 	try {
-		const result = await publishApprovedCarousel(env, postId, { prepareOnly });
-		return new Response(JSON.stringify(result), {
-			status: 200,
-			headers: { "Content-Type": "application/json" },
-		});
+		if (mediaType === "IMAGE") {
+			const result = await publishSingleImage(env, {
+				postId: postId || undefined,
+				storagePath: storagePath || undefined,
+				caption: body?.caption,
+				options: { prepareOnly },
+			});
+			return new Response(JSON.stringify(result), {
+				status: result.success ? 200 : 400,
+				headers: { "Content-Type": "application/json" },
+			});
+		} else {
+			const result = await publishApprovedCarousel(env, postId, { prepareOnly });
+			return new Response(JSON.stringify(result), {
+				status: 200,
+				headers: { "Content-Type": "application/json" },
+			});
+		}
 	} catch (err: any) {
-		const message = sanitizeMetaError(err.message || "Failed to publish carousel to Instagram.");
+		const message = sanitizeMetaError(err.message || "Failed to publish to Instagram.");
 		return new Response(
 			JSON.stringify({
 				success: false,

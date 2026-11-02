@@ -145,11 +145,13 @@ import {
 	preparePublishingAssets,
 	createCarouselItemContainer,
 	createCarouselContainer,
+	createSingleImageContainer,
 	getContainerStatus,
 	pollContainerUntilReady,
 	publishMediaContainer,
 	getPublishedMediaDetails,
 	publishApprovedCarousel,
+	publishSingleImage,
 	handlePublishInstagram,
 	DEFAULT_INSTAGRAM_GRAPH_VERSION,
 	INSTAGRAM_LOGIN_API_BASE_URL,
@@ -160,6 +162,8 @@ import {
 	MAX_INSTAGRAM_IMAGE_SIZE_BYTES,
 	type InstagramPublishingConfig,
 	type InstagramAuthMode,
+	type PublishSingleImageParams,
+	type PublishSingleImageResult,
 } from "../src/services/instagram-publishing";
 
 const IncomingRequest = Request<unknown, IncomingRequestCfProperties>;
@@ -12776,10 +12780,11 @@ describe("Task 10 - Global Hot Legal Topic Selection Using Groq", () => {
 					}
 
 					// GET account verification
-					if (method === "GET" && url.includes("?fields=id,username,name")) {
+					if (method === "GET" && (url.includes("?fields=id,username,name") || url.includes("me?fields=user_id,username"))) {
 						return new Response(
 							JSON.stringify({
 								id: "17841400000000000",
+								user_id: "17841400000000000",
 								username: "lawbriefly",
 								name: "LawBriefly Legal News",
 							}),
@@ -12803,6 +12808,28 @@ describe("Task 10 - Global Hot Legal Topic Selection Using Groq", () => {
 							);
 						}
 						const randId = `child_container_${Math.floor(Math.random() * 900000) + 100000}`;
+						return new Response(JSON.stringify({ id: randId }), {
+							status: 200,
+							headers: { "Content-Type": "application/json" },
+						});
+					}
+
+					// POST single image container
+					if (method === "POST" && url.endsWith("/media") && body?.image_url && !body?.is_carousel_item && !body?.media_type) {
+						if (options.shouldFailContainer) {
+							return new Response(
+								JSON.stringify({
+									error: {
+										message: "The image format is not supported. Please use JPEG.",
+										type: "OAuthException",
+										code: 36003,
+										error_subcode: 2207001,
+									},
+								}),
+								{ status: 400, headers: { "Content-Type": "application/json" } }
+							);
+						}
+						const randId = `single_container_${Math.floor(Math.random() * 900000) + 100000}`;
 						return new Response(JSON.stringify({ id: randId }), {
 							status: 200,
 							headers: { "Content-Type": "application/json" },
@@ -13022,15 +13049,25 @@ describe("Task 10 - Global Hot Legal Topic Selection Using Groq", () => {
 					expect(fbVerification.valid).toBe(true);
 					expect(fbVerification.login_type).toBe("facebook_login");
 					expect(fbVerification.api_host).toBe("https://graph.facebook.com");
-					expect(fbCalls[0].url).toContain("https://graph.facebook.com/");
+					expect(fbCalls[0].url).toBe("https://graph.facebook.com/v22.0/17841400000000000?fields=id,username,name");
 
-					// Verify with instagram_login
+					// Verify with instagram_login (canonical /me?fields=user_id,username endpoint)
 					const { calls: igCalls } = setupMetaFetchMock();
 					const igVerification = await verifyInstagramCredentials(mockInstagramDirectEnv);
 					expect(igVerification.valid).toBe(true);
 					expect(igVerification.login_type).toBe("instagram_login");
 					expect(igVerification.api_host).toBe("https://graph.instagram.com");
-					expect(igCalls[0].url).toContain("https://graph.instagram.com/");
+					expect(igCalls[0].url).toBe("https://graph.instagram.com/v26.0/me?fields=user_id,username");
+
+					// Test Account ID mismatch safely detected in instagram_login
+					setupMetaFetchMock();
+					const envMismatched: Env = {
+						...mockInstagramDirectEnv,
+						INSTAGRAM_ACCOUNT_ID: "99999999999999999", // Different from mocked 17841400000000000
+					};
+					const mismatchedVerification = await verifyInstagramCredentials(envMismatched);
+					expect(mismatchedVerification.valid).toBe(false);
+					expect(mismatchedVerification.error).toContain("Instagram Account ID mismatch");
 
 					// Test 401 error safely handled
 					setupMetaFetchMock({ shouldFailAuth: true });
@@ -13354,6 +13391,199 @@ describe("Task 10 - Global Hot Legal Topic Selection Using Groq", () => {
 					// Never calls media_publish
 					expect(calls.some((c) => c.url.endsWith("/media_publish"))).toBe(false);
 					expect(mockSupabase.getPost().post_status).toBe("approved");
+				});
+			});
+
+			describe("Single Image Publishing Tests", () => {
+				const igConfig: InstagramPublishingConfig = {
+					accessToken: "mock_test_instagram_token_xyz987",
+					accountId: "17841422733573452",
+					graphVersion: "v26.0",
+					authMode: "instagram_login",
+					apiBaseUrl: INSTAGRAM_LOGIN_API_BASE_URL,
+				};
+
+				it("26. createSingleImageContainer creates single image container with image_url and caption", async () => {
+					const { calls } = setupMetaFetchMock();
+					const containerId = await createSingleImageContainer(
+						igConfig,
+						"https://kacfrcnzxstclzrceugg.supabase.co/storage/v1/object/sign/lawbriefly-carousel-assets/posts/slide-01.jpg?token=abc",
+						"LawBriefly Single Image Update #LegalTech"
+					);
+
+					expect(containerId).toContain("single_container_");
+					expect(calls[0].url).toBe("https://graph.instagram.com/v26.0/17841422733573452/media");
+					expect(calls[0].body.image_url).toBe(
+						"https://kacfrcnzxstclzrceugg.supabase.co/storage/v1/object/sign/lawbriefly-carousel-assets/posts/slide-01.jpg?token=abc"
+					);
+					expect(calls[0].body.caption).toBe("LawBriefly Single Image Update #LegalTech");
+					expect(calls[0].body.is_carousel_item).toBeUndefined();
+					expect(calls[0].body.media_type).toBeUndefined();
+					expect(calls[0].headers.Authorization).toBe("Bearer mock_test_instagram_token_xyz987");
+				});
+
+				it("27. createSingleImageContainer rejects non-HTTPS or missing image URLs", async () => {
+					await expect(
+						createSingleImageContainer(igConfig, "http://insecure.test/image.jpg")
+					).rejects.toThrow("Invalid image_url: must be a valid HTTPS URL.");
+
+					await expect(
+						createSingleImageContainer(igConfig, "")
+					).rejects.toThrow("Invalid image_url: must be a valid HTTPS URL.");
+				});
+
+				it("28. createSingleImageContainer sanitizes Meta Graph API errors", async () => {
+					setupMetaFetchMock({ shouldFailContainer: true });
+					await expect(
+						createSingleImageContainer(igConfig, "https://storage.test/invalid.png")
+					).rejects.toThrow("The image format is not supported. Please use JPEG.");
+				});
+
+				it("29. publishSingleImage in prepare-only mode converts PNG, generates signed URL, creates container, and stops before publishing", async () => {
+					const mockSupabase = createMockPublishingSupabase();
+					vi.spyOn(supabaseModule, "getSupabaseClient").mockReturnValue(mockSupabase.mockClient as any);
+					const { calls } = setupMetaFetchMock();
+
+					const result = await publishSingleImage(mockInstagramDirectEnv, {
+						postId: "17000000-0000-0000-0000-000000001700",
+						options: {
+							prepareOnly: true,
+							customConverter: async () => createSyntheticJpegBuffer(1080, 1350),
+						},
+					});
+
+					expect(result.success).toBe(true);
+					expect(result.prepare_only).toBe(true);
+					expect(result.container_id).toContain("single_container_");
+					expect(result.image_url).toContain("token=mock_secret_signed_token");
+
+					// Assert media_publish was never called
+					expect(calls.some((c) => c.url.endsWith("/media_publish"))).toBe(false);
+
+					// Database post status remains 'approved'
+					expect(mockSupabase.getPost().post_status).toBe("approved");
+				});
+
+				it("30. publishSingleImage in live mode publishes container, fetches permalink, and updates Supabase post to published", async () => {
+					const mockSupabase = createMockPublishingSupabase();
+					vi.spyOn(supabaseModule, "getSupabaseClient").mockReturnValue(mockSupabase.mockClient as any);
+					const { calls } = setupMetaFetchMock();
+
+					const result = await publishSingleImage(mockInstagramDirectEnv, {
+						postId: "17000000-0000-0000-0000-000000001700",
+						options: {
+							prepareOnly: false,
+							customConverter: async () => createSyntheticJpegBuffer(1080, 1350),
+						},
+					});
+
+					expect(result.success).toBe(true);
+					expect(result.prepare_only).toBe(false);
+					expect(result.container_id).toContain("single_container_");
+					expect(result.instagram_media_id).toBe("17999999999999999");
+					expect(result.instagram_permalink).toContain("https://www.instagram.com/p/");
+
+					// Assert media_publish was called with creation_id
+					const publishCall = calls.find((c) => c.url.endsWith("/media_publish"));
+					expect(publishCall).toBeDefined();
+					expect(publishCall?.body.creation_id).toBe(result.container_id);
+
+					// Assert post was marked 'published' in Supabase
+					expect(mockSupabase.getPost().post_status).toBe("published");
+				});
+
+				it("31. publishSingleImage strictly prevents duplicate publishing on already published or publishing posts", async () => {
+					const mockPublished = createMockPublishingSupabase({
+						post: {
+							id: "17000000-0000-0000-0000-000000001700",
+							post_status: "published",
+						},
+					});
+					vi.spyOn(supabaseModule, "getSupabaseClient").mockReturnValue(mockPublished.mockClient as any);
+
+					const resPublished = await publishSingleImage(mockInstagramDirectEnv, {
+						postId: "17000000-0000-0000-0000-000000001700",
+					});
+					expect(resPublished.success).toBe(false);
+					expect(resPublished.error_code).toBe("POST_ALREADY_PUBLISHED");
+
+					const mockPublishing = createMockPublishingSupabase({
+						post: {
+							id: "17000000-0000-0000-0000-000000001700",
+							post_status: "publishing",
+						},
+					});
+					vi.spyOn(supabaseModule, "getSupabaseClient").mockReturnValue(mockPublishing.mockClient as any);
+
+					const resPublishing = await publishSingleImage(mockInstagramDirectEnv, {
+						postId: "17000000-0000-0000-0000-000000001700",
+					});
+					expect(resPublishing.success).toBe(false);
+					expect(resPublishing.error_code).toBe("PUBLISHING_IN_PROGRESS");
+				});
+
+				it("32. publishSingleImage supports direct storagePath publishing", async () => {
+					const mockSupabase = createMockPublishingSupabase();
+					vi.spyOn(supabaseModule, "getSupabaseClient").mockReturnValue(mockSupabase.mockClient as any);
+					setupMetaFetchMock();
+
+					const result = await publishSingleImage(mockInstagramDirectEnv, {
+						storagePath: "posts/custom-image.jpg",
+						caption: "Standalone Image #TaxLaw",
+						options: { prepareOnly: true },
+					});
+
+					expect(result.success).toBe(true);
+					expect(result.container_id).toContain("single_container_");
+					expect(result.storage_path).toBe("posts/custom-image.jpg");
+				});
+
+				it("33. handlePublishInstagram routes media_type: IMAGE to publishSingleImage via worker.fetch", async () => {
+					const mockSupabase = createMockPublishingSupabase();
+					vi.spyOn(supabaseModule, "getSupabaseClient").mockReturnValue(mockSupabase.mockClient as any);
+					setupMetaFetchMock();
+
+					// Mock Puppeteer
+					const mockPage = {
+						setViewport: vi.fn().mockResolvedValue(undefined),
+						setContent: vi.fn().mockResolvedValue(undefined),
+						screenshot: vi.fn().mockResolvedValue(createSyntheticJpegBuffer(1080, 1350)),
+					};
+					vi.spyOn(puppeteer, "launch").mockResolvedValue({
+						newPage: vi.fn().mockResolvedValue(mockPage),
+						close: vi.fn().mockResolvedValue(undefined),
+					} as any);
+
+					const req = new Request("http://localhost/api/ai/publish-instagram", {
+						method: "POST",
+						headers: { "Content-Type": "application/json" },
+						body: JSON.stringify({
+							post_id: "17000000-0000-0000-0000-000000001700",
+							media_type: "IMAGE",
+							prepare_only: true,
+						}),
+					});
+
+					const ctx = createExecutionContext();
+					const response = await worker.fetch(req, mockInstagramDirectEnv, ctx);
+					await waitOnExecutionContext(ctx);
+
+					expect(response.status).toBe(200);
+					const data = (await response.json()) as any;
+					expect(data.success).toBe(true);
+					expect(data.prepare_only).toBe(true);
+					expect(data.container_id).toContain("single_container_");
+				});
+
+				it("34. getValidatedInstagramConfig supports INSTAGRAM_USER_ID fallback", () => {
+					const envUserIdOnly: Env = {
+						...mockInstagramDirectEnv,
+						INSTAGRAM_ACCOUNT_ID: undefined,
+						INSTAGRAM_USER_ID: "17841422733573542",
+					};
+					const config = getValidatedInstagramConfig(envUserIdOnly);
+					expect(config.accountId).toBe("17841422733573542");
+					expect(config.apiBaseUrl).toBe("https://graph.instagram.com");
 				});
 			});
 		});

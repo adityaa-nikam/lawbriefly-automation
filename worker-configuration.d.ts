@@ -21,6 +21,7 @@ interface __BaseEnv_Env {
 	INSTAGRAM_AUTH_MODE?: string;
 	INSTAGRAM_ACCESS_TOKEN?: string;
 	INSTAGRAM_ACCOUNT_ID?: string;
+	INSTAGRAM_USER_ID?: string;
 	INSTAGRAM_GRAPH_VERSION?: string;
 }
 declare namespace Cloudflare {
