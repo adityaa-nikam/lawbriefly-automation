@@ -442,6 +442,7 @@ export async function notifyEditorForStoredPost(
 				.update({
 					notification_status: "media_sent",
 					telegram_media_message_ids: mediaMessageIds,
+					last_error_code: null,
 					updated_at: new Date().toISOString(),
 				})
 				.eq("id", approvalRequestId);
@@ -532,12 +533,13 @@ export async function notifyEditorForStoredPost(
 	// 11. Finalize database state upon 100% successful delivery
 	const completedAt = new Date().toISOString();
 
-	// Update approval request to 'sent'
+	// Update approval request to 'sent' and clear any previous error codes
 	await supabase
 		.from("social_content_approval_requests")
 		.update({
 			notification_status: "sent",
 			telegram_control_message_id: controlMessageId,
+			last_error_code: null,
 			sent_at: completedAt,
 			updated_at: completedAt,
 		})
@@ -589,6 +591,7 @@ export async function processTelegramCallback(
 	env: Env
 ): Promise<ProcessCallbackResult> {
 	if (!update || !update.callback_query) {
+		console.warn("[Telegram Approval Stage 1] Update rejected: missing callback_query object.");
 		return { success: false, error_code: "NO_CALLBACK_QUERY", error: "Update contains no callback_query." };
 	}
 
@@ -603,6 +606,8 @@ export async function processTelegramCallback(
 	// 1. Validate callback data format: "a:<token>" or "r:<token>"
 	const match = data.match(/^([ar]):([0-9a-fA-F]{16,64})$/);
 	if (!match) {
+		console.warn(`[Telegram Webhook] Rejected malformed callback data (query_id: ${callbackQueryId || "unknown"})`);
+
 		if (callbackQueryId) {
 			await answerCallbackQuery(telegramConfig.botToken, callbackQueryId, {
 				text: "Invalid callback query format.",
@@ -618,7 +623,11 @@ export async function processTelegramCallback(
 
 	// 2. Editor Allowlist Check (numeric Telegram user ID)
 	const numericUserIdStr = String(fromUser.id);
-	if (!telegramConfig.allowedUserIds.has(numericUserIdStr)) {
+	const isAuthorized = telegramConfig.allowedUserIds.has(numericUserIdStr);
+
+	if (!isAuthorized) {
+		console.warn(`[Telegram Webhook] Rejected unauthorized editor (user_id: ${numericUserIdStr})`);
+
 		if (callbackQueryId) {
 			await answerCallbackQuery(telegramConfig.botToken, callbackQueryId, {
 				text: "Unauthorized: You do not have permission to review this post.",
@@ -633,7 +642,11 @@ export async function processTelegramCallback(
 	}
 
 	// 3. Chat ID Match Check
-	if (message?.chat?.id && String(message.chat.id) !== telegramConfig.chatId) {
+	const chatMatch = !message?.chat?.id || String(message.chat.id) === telegramConfig.chatId;
+
+	if (!chatMatch) {
+		console.warn("[Telegram Webhook] Rejected callback from mismatched chat ID");
+
 		if (callbackQueryId) {
 			await answerCallbackQuery(telegramConfig.botToken, callbackQueryId, {
 				text: "Unauthorized: Message is from an unrecognized chat.",
@@ -647,23 +660,40 @@ export async function processTelegramCallback(
 		};
 	}
 
-	// 4. Compute SHA-256 token hash
+	// 4. Compute SHA-256 token hash (never log raw token)
 	const tokenHash = await calculateSha256(rawToken);
 	const supabase = getSupabaseClient(env);
 	const username = fromUser.username ? `@${fromUser.username}` : fromUser.first_name || numericUserIdStr;
 
 	// 5. Execute Atomic Decision Transition
-	// First attempt atomic stored procedure: process_editorial_approval_decision
-	const { data: rpcResult, error: rpcError } = await supabase.rpc("process_editorial_approval_decision", {
-		p_token_hash: tokenHash,
-		p_action: action,
-		p_telegram_user_id: numericUserIdStr,
-		p_telegram_username: username,
-		p_telegram_chat_id: telegramConfig.chatId,
-		p_telegram_message_id: message?.message_id || null,
-		p_telegram_update_id: update.update_id || null,
-		p_telegram_callback_query_id: callbackQueryId || null,
-	});
+	let rawRpcResult: any = null;
+	let rpcError: any = null;
+
+	try {
+		const res = await supabase.rpc("process_editorial_approval_decision", {
+			p_token_hash: tokenHash,
+			p_action: action,
+			p_telegram_user_id: numericUserIdStr,
+			p_telegram_username: username,
+			p_telegram_chat_id: telegramConfig.chatId,
+			p_telegram_message_id: message?.message_id || null,
+			p_telegram_update_id: update.update_id || null,
+			p_telegram_callback_query_id: callbackQueryId || null,
+		});
+		rawRpcResult = res.data;
+		rpcError = res.error;
+	} catch (err: any) {
+		rpcError = { message: err?.message || String(err), code: "RPC_THROWN_EXCEPTION" };
+	}
+
+	let rpcResult = rawRpcResult;
+	if (typeof rawRpcResult === "string") {
+		try {
+			rpcResult = JSON.parse(rawRpcResult);
+		} catch {
+			// keep raw string if not JSON
+		}
+	}
 
 	let decisionSuccess = false;
 	let postId = "";
@@ -673,123 +703,150 @@ export async function processTelegramCallback(
 	let isDuplicate = false;
 	let decisionStatus: "approved" | "rejected" | undefined;
 
-	if (!rpcError && rpcResult && typeof rpcResult === "object") {
-		decisionSuccess = Boolean(rpcResult.success);
-		postId = rpcResult.post_id;
-		approvalRequestId = rpcResult.approval_request_id;
-		errorCode = rpcResult.error_code;
-		errorMessage = rpcResult.message;
-		isDuplicate = Boolean(rpcResult.is_duplicate);
-		decisionStatus = rpcResult.decision_status;
-	} else {
-		// Fallback for mocked test environments where the RPC function is not mocked or installed
-		// Check for duplicate callback query in events table (global deduplication)
-		if (callbackQueryId) {
-			const { data: existingEvent } = await supabase
-				.from("social_content_approval_events")
-				.select("*, social_content_approval_requests(*)")
-				.eq("telegram_callback_query_id", callbackQueryId)
-				.maybeSingle();
+	if (rpcError) {
+		// Fallback only if the stored procedure does not exist in the schema cache (e.g. unmocked test fixtures)
+		const isFunctionMissing =
+			rpcError.code === "PGRST202" ||
+			rpcError.message?.toLowerCase().includes("function") ||
+			rpcError.message?.toLowerCase().includes("does not exist");
 
-			if (existingEvent) {
-				const req = existingEvent.social_content_approval_requests;
-				isDuplicate = true;
-				decisionSuccess = true;
-				postId = existingEvent.post_id;
-				approvalRequestId = existingEvent.approval_request_id;
-				decisionStatus = req?.decision_status || (action === "approve" ? "approved" : "rejected");
-				errorMessage = "Callback query already processed (idempotent duplicate)";
-			}
-		}
+		if (isFunctionMissing) {
+			console.warn("[Telegram Webhook] Stored procedure missing from schema; executing direct table fallback.");
+			// Check for duplicate callback query in events table (global deduplication)
+			if (callbackQueryId) {
+				const { data: existingEvent } = await supabase
+					.from("social_content_approval_events")
+					.select("*, social_content_approval_requests(*)")
+					.eq("telegram_callback_query_id", callbackQueryId)
+					.maybeSingle();
 
-		if (!isDuplicate) {
-			const { data: actionRow } = await supabase
-				.from("social_content_approval_actions")
-				.select("*, social_content_approval_requests(*)")
-				.eq("token_hash", tokenHash)
-				.maybeSingle();
-
-			if (!actionRow) {
-				errorCode = "TOKEN_NOT_FOUND";
-				errorMessage = "Approval action token not found in database.";
-			} else if (actionRow.action !== action) {
-				errorCode = "ACTION_MISMATCH";
-				errorMessage = "Action does not match token action.";
-			} else if (actionRow.consumed_at !== null) {
-				errorCode = "TOKEN_ALREADY_CONSUMED";
-				errorMessage = "Callback token has already been consumed.";
-				const req = actionRow.social_content_approval_requests;
-				if (req) {
-					decisionStatus = req.decision_status;
+				if (existingEvent) {
+					const req = existingEvent.social_content_approval_requests;
+					isDuplicate = true;
+					decisionSuccess = true;
+					postId = existingEvent.post_id;
+					approvalRequestId = existingEvent.approval_request_id;
+					decisionStatus = req?.decision_status || (action === "approve" ? "approved" : "rejected");
+					errorMessage = "Callback query already processed (idempotent duplicate)";
 				}
-			} else {
-				const req = actionRow.social_content_approval_requests;
-				if (!req || req.decision_status !== "pending") {
-					errorCode = "ALREADY_DECIDED";
-					errorMessage = `Request already decided: ${req?.decision_status || "unknown"}`;
+			}
+
+			if (!isDuplicate) {
+				const { data: actionRow } = await supabase
+					.from("social_content_approval_actions")
+					.select("*, social_content_approval_requests(*)")
+					.eq("token_hash", tokenHash)
+					.maybeSingle();
+
+				if (!actionRow) {
+					errorCode = "TOKEN_NOT_FOUND";
+					errorMessage = "Approval action token not found in database.";
+				} else if (actionRow.action !== action) {
+					errorCode = "ACTION_MISMATCH";
+					errorMessage = "Action does not match token action.";
+				} else if (actionRow.consumed_at !== null) {
+					errorCode = "TOKEN_ALREADY_CONSUMED";
+					errorMessage = "Callback token has already been consumed.";
+					const req = actionRow.social_content_approval_requests;
 					if (req) {
 						decisionStatus = req.decision_status;
 					}
-				} else if (new Date(req.expires_at).getTime() <= Date.now()) {
-					errorCode = "REQUEST_EXPIRED";
-					errorMessage = "Approval request has expired.";
-					await supabase
-						.from("social_content_approval_requests")
-						.update({ decision_status: "expired" })
-						.eq("id", req.id);
 				} else {
-					const now = new Date().toISOString();
-					const targetStatus = action === "approve" ? "approved" : "rejected";
+					const req = actionRow.social_content_approval_requests;
+					if (!req || req.decision_status !== "pending") {
+						errorCode = "ALREADY_DECIDED";
+						errorMessage = `Request already decided: ${req?.decision_status || "unknown"}`;
+						if (req) {
+							decisionStatus = req.decision_status;
+						}
+					} else if (new Date(req.expires_at).getTime() <= Date.now()) {
+						errorCode = "REQUEST_EXPIRED";
+						errorMessage = "Approval request has expired.";
+						await supabase
+							.from("social_content_approval_requests")
+							.update({ decision_status: "expired" })
+							.eq("id", req.id);
+					} else {
+						const now = new Date().toISOString();
+						const targetStatus = action === "approve" ? "approved" : "rejected";
 
-					// Consume action token
-					await supabase
-						.from("social_content_approval_actions")
-						.update({ consumed_at: now })
-						.eq("id", actionRow.id);
+						// Consume action token
+						await supabase
+							.from("social_content_approval_actions")
+							.update({ consumed_at: now })
+							.eq("id", actionRow.id);
 
-					// Update approval request
-					await supabase
-						.from("social_content_approval_requests")
-						.update({
-							decision_status: targetStatus,
-							decided_at: now,
-							decided_by_telegram_user_id: numericUserIdStr,
-							decided_by_username: username,
-							updated_at: now,
-						})
-						.eq("id", req.id);
+						// Update approval request
+						await supabase
+							.from("social_content_approval_requests")
+							.update({
+								decision_status: targetStatus,
+								decided_at: now,
+								decided_by_telegram_user_id: numericUserIdStr,
+								decided_by_username: username,
+								last_error_code: null,
+								updated_at: now,
+							})
+							.eq("id", req.id);
 
-					// Update post status
-					await supabase
-						.from("social_content_posts")
-						.update({
-							post_status: targetStatus,
-							updated_at: now,
-						})
-						.eq("id", req.post_id);
+						// Update post status
+						await supabase
+							.from("social_content_posts")
+							.update({
+								post_status: targetStatus,
+								updated_at: now,
+							})
+							.eq("id", req.post_id);
 
-					// Insert event
-					await supabase.from("social_content_approval_events").insert({
-						approval_request_id: req.id,
-						post_id: req.post_id,
-						event_type: `decision_${targetStatus}`,
-						telegram_update_id: update.update_id || null,
-						telegram_callback_query_id: callbackQueryId,
-						telegram_user_id: numericUserIdStr,
-						telegram_username: username,
-						telegram_chat_id: telegramConfig.chatId,
-						telegram_message_id: message?.message_id || null,
-						details: { action, previous_status: "pending_approval", new_status: targetStatus },
-						created_at: now,
-					});
+						// Insert event
+						await supabase.from("social_content_approval_events").insert({
+							approval_request_id: req.id,
+							post_id: req.post_id,
+							event_type: `decision_${targetStatus}`,
+							telegram_update_id: update.update_id || null,
+							telegram_callback_query_id: callbackQueryId,
+							telegram_user_id: numericUserIdStr,
+							telegram_username: username,
+							telegram_chat_id: telegramConfig.chatId,
+							telegram_message_id: message?.message_id || null,
+							details: { action, previous_status: "pending_approval", new_status: targetStatus },
+							created_at: now,
+						});
 
-					decisionSuccess = true;
-					decisionStatus = targetStatus;
-					postId = req.post_id;
-					approvalRequestId = req.id;
+						decisionSuccess = true;
+						decisionStatus = targetStatus;
+						postId = req.post_id;
+						approvalRequestId = req.id;
+					}
 				}
 			}
+		} else {
+			// Real database RPC error is NOT swallowed!
+			decisionSuccess = false;
+			errorCode = rpcError.code || "RPC_ERROR";
+			errorMessage = `Supabase RPC execution failed: ${rpcError.message}`;
+			console.error(`[Telegram Webhook] Approval decision RPC failed (code: ${errorCode}): ${errorMessage}`);
 		}
+	} else if (rpcResult && typeof rpcResult === "object") {
+		decisionSuccess = Boolean(rpcResult.success);
+		postId = rpcResult.post_id || "";
+		approvalRequestId = rpcResult.approval_request_id || "";
+		errorCode = rpcResult.error_code || "";
+		errorMessage = rpcResult.message || "";
+		isDuplicate = Boolean(rpcResult.is_duplicate);
+		decisionStatus = rpcResult.decision_status;
+
+		if (!decisionSuccess && errorCode) {
+			console.warn(`[Telegram Webhook] Approval decision rejected (code: ${errorCode}): ${errorMessage}`);
+		}
+	} else {
+		console.error("[Telegram Webhook] Supabase RPC returned unexpected empty/null result.");
+		errorCode = "EMPTY_RPC_RESULT";
+		errorMessage = "Supabase RPC returned an empty result.";
+	}
+
+	if (decisionSuccess) {
+		console.log(`[Telegram Webhook] Decision recorded: action=${action}, post_id=${postId}, request_id=${approvalRequestId}, decision_status=${decisionStatus || action}`);
 	}
 
 	if (isDuplicate) {
@@ -982,6 +1039,7 @@ export async function handleTelegramWebhook(request: Request, env: Env): Promise
 	const configuredSecret = (env.TELEGRAM_WEBHOOK_SECRET || "").trim();
 
 	if (!configuredSecret || !timingSafeEqualStrings(secretHeader, configuredSecret)) {
+		console.warn("[Telegram Webhook] Authentication failed: invalid secret token header.");
 		return new Response(JSON.stringify({ error: "Unauthorized", status: 401 }), {
 			status: 401,
 			headers: { "Content-Type": "application/json" },
@@ -1039,7 +1097,7 @@ export async function handleTelegramWebhook(request: Request, env: Env): Promise
 			headers: { "Content-Type": "application/json" },
 		});
 	} catch (err: any) {
-		console.error("Error processing Telegram callback query:", err);
+		console.error("[Telegram Webhook] Unhandled error processing Telegram callback query:", err.message || err);
 		// Return 200 to Telegram to prevent retry storm on unrecoverable logic errors
 		return new Response(JSON.stringify({ success: false, error: err.message || "Failed to process update" }), {
 			status: 200,

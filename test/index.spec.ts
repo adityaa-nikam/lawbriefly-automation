@@ -12327,6 +12327,233 @@ describe("Task 10 - Global Hot Legal Topic Selection Using Groq", () => {
 					expect(validated.webhookSecret).toBe("my_secret_token_val");
 					expect(validated.ttlHours).toBe(48);
 				});
+
+				it("57. processTelegramCallback executes valid approval decision via process_editorial_approval_decision RPC", async () => {
+					const rawToken = "0123456789abcdef0123456789abcdef";
+					const tokenHash = await calculateSha256(rawToken);
+
+					const mockSupabase = createMockTelegramSupabase({
+						existingRequest: {
+							id: "req-uuid-rpc-test",
+							post_id: "16000000-0000-0000-0000-000000001600",
+							decision_status: "pending",
+							telegram_chat_id: "-1001234567890",
+							telegram_control_message_id: 201,
+							expires_at: new Date(Date.now() + 3600000).toISOString(),
+						},
+						existingActions: [
+							{
+								id: "act-rpc-1",
+								approval_request_id: "req-uuid-rpc-test",
+								action: "approve",
+								token_hash: tokenHash,
+								consumed_at: null,
+							},
+						],
+					});
+					vi.spyOn(supabaseModule, "getSupabaseClient").mockReturnValue(mockSupabase.mockClient as any);
+					const { calls } = setupTelegramFetchMock();
+
+					const update: TelegramUpdate = {
+						update_id: 20001,
+						callback_query: {
+							id: "cbq_valid_approve",
+							from: { id: 123456789, is_bot: false, first_name: "Aditya", username: "adityanikam" },
+							message: { message_id: 201, chat: { id: -1001234567890, type: "supergroup" }, date: Math.floor(Date.now() / 1000) },
+							data: `a:${rawToken}`,
+						},
+					};
+
+					const result = await processTelegramCallback(update, mockTelegramDevEnv);
+					expect(result.success).toBe(true);
+					expect(result.decision_status).toBe("approved");
+					expect(result.action).toBe("approve");
+					expect(mockSupabase.getPost().post_status).toBe("approved");
+
+					// Verify answerCallbackQuery was called
+					expect(calls.some((c) => c.url.includes("/answerCallbackQuery"))).toBe(true);
+					// Verify editMessageText was called
+					expect(calls.some((c) => c.url.includes("/editMessageText"))).toBe(true);
+				});
+
+				it("58. processTelegramCallback surfaces Supabase RPC execution error without silently swallowing it", async () => {
+					const rawToken = "0123456789abcdef0123456789abcdef";
+					const tokenHash = await calculateSha256(rawToken);
+
+					const mockSupabase = createMockTelegramSupabase({
+						existingRequest: {
+							id: "req-uuid-err-test",
+							post_id: "16000000-0000-0000-0000-000000001600",
+							decision_status: "pending",
+							telegram_chat_id: "-1001234567890",
+							expires_at: new Date(Date.now() + 3600000).toISOString(),
+						},
+						existingActions: [
+							{
+								id: "act-rpc-err",
+								approval_request_id: "req-uuid-err-test",
+								action: "approve",
+								token_hash: tokenHash,
+								consumed_at: null,
+							},
+						],
+					});
+
+					// Simulate actual database execution error from RPC (not a missing function error)
+					mockSupabase.mockClient.rpc = vi.fn().mockResolvedValue({
+						data: null,
+						error: { code: "PGRST500", message: "Database connection failed", details: "Connection timed out" },
+					});
+					vi.spyOn(supabaseModule, "getSupabaseClient").mockReturnValue(mockSupabase.mockClient as any);
+					const { calls } = setupTelegramFetchMock();
+
+					const update: TelegramUpdate = {
+						update_id: 20002,
+						callback_query: {
+							id: "cbq_rpc_err",
+							from: { id: 123456789, is_bot: false, first_name: "Aditya" },
+							message: { message_id: 201, chat: { id: -1001234567890, type: "supergroup" }, date: Math.floor(Date.now() / 1000) },
+							data: `a:${rawToken}`,
+						},
+					};
+
+					const result = await processTelegramCallback(update, mockTelegramDevEnv);
+					expect(result.success).toBe(false);
+					expect(result.error_code).toBe("PGRST500");
+					expect(result.error).toContain("Database connection failed");
+					// Post status must NOT have changed
+					expect(mockSupabase.getPost().post_status).toBe("stored");
+
+					// Verify user received alert
+					expect(calls.some((c) => c.url.includes("/answerCallbackQuery"))).toBe(true);
+					const answerBody = JSON.parse(calls.find((c) => c.url.includes("/answerCallbackQuery"))!.body);
+					expect(answerBody.show_alert).toBe(true);
+				});
+
+				it("59. processTelegramCallback rejects token/action mismatch and alerts user", async () => {
+					const rawToken = "0123456789abcdef0123456789abcdef";
+					const tokenHash = await calculateSha256(rawToken);
+
+					const mockSupabase = createMockTelegramSupabase({
+						existingRequest: {
+							id: "req-uuid-mismatch-test",
+							post_id: "16000000-0000-0000-0000-000000001600",
+							decision_status: "pending",
+							telegram_chat_id: "-1001234567890",
+							expires_at: new Date(Date.now() + 3600000).toISOString(),
+						},
+						existingActions: [
+							{
+								id: "act-mismatch",
+								approval_request_id: "req-uuid-mismatch-test",
+								action: "reject", // Database action is reject!
+								token_hash: tokenHash,
+								consumed_at: null,
+							},
+						],
+					});
+					vi.spyOn(supabaseModule, "getSupabaseClient").mockReturnValue(mockSupabase.mockClient as any);
+					const { calls } = setupTelegramFetchMock();
+
+					// Sent with "a:" prefix instead of "r:"
+					const update: TelegramUpdate = {
+						update_id: 20003,
+						callback_query: {
+							id: "cbq_action_mismatch",
+							from: { id: 123456789, is_bot: false, first_name: "Aditya" },
+							message: { message_id: 201, chat: { id: -1001234567890, type: "supergroup" }, date: Math.floor(Date.now() / 1000) },
+							data: `a:${rawToken}`,
+						},
+					};
+
+					const result = await processTelegramCallback(update, mockTelegramDevEnv);
+					expect(result.success).toBe(false);
+					expect(result.error_code).toBe("ACTION_MISMATCH");
+
+					// Verify alert was sent to user
+					expect(calls.some((c) => c.url.includes("/answerCallbackQuery"))).toBe(true);
+					const answerPayload = JSON.parse(calls.find((c) => c.url.includes("/answerCallbackQuery"))!.body);
+					expect(answerPayload.show_alert).toBe(true);
+				});
+
+				it("60. processTelegramCallback rejects unauthorized editor and never invokes Supabase RPC", async () => {
+					const mockSupabase = createMockTelegramSupabase();
+					const rpcSpy = vi.spyOn(mockSupabase.mockClient, "rpc");
+					vi.spyOn(supabaseModule, "getSupabaseClient").mockReturnValue(mockSupabase.mockClient as any);
+					const { calls } = setupTelegramFetchMock();
+
+					const update: TelegramUpdate = {
+						update_id: 20004,
+						callback_query: {
+							id: "cbq_unauth_user",
+							from: { id: 888888888, is_bot: false, first_name: "Unknown" }, // Not in allowlist
+							message: { message_id: 201, chat: { id: -1001234567890, type: "supergroup" }, date: Math.floor(Date.now() / 1000) },
+							data: "a:0123456789abcdef0123456789abcdef",
+						},
+					};
+
+					const result = await processTelegramCallback(update, mockTelegramDevEnv);
+					expect(result.success).toBe(false);
+					expect(result.error_code).toBe("UNAUTHORIZED_USER");
+					expect(rpcSpy).not.toHaveBeenCalled();
+
+					// Verify alert sent
+					expect(calls.some((c) => c.url.includes("/answerCallbackQuery"))).toBe(true);
+					const answerPayload = JSON.parse(calls.find((c) => c.url.includes("/answerCallbackQuery"))!.body);
+					expect(answerPayload.show_alert).toBe(true);
+				});
+
+				it("61. handleTelegramWebhook processes valid callback query, dispatches HTTP 200, and returns callback result", async () => {
+					const rawToken = "abcdef0123456789abcdef0123456789";
+					const tokenHash = await calculateSha256(rawToken);
+
+					const mockSupabase = createMockTelegramSupabase({
+						existingRequest: {
+							id: "req-uuid-webhook-test",
+							post_id: "16000000-0000-0000-0000-000000001600",
+							decision_status: "pending",
+							telegram_chat_id: "-1001234567890",
+							telegram_control_message_id: 201,
+							expires_at: new Date(Date.now() + 3600000).toISOString(),
+						},
+						existingActions: [
+							{
+								id: "act-webhook-test",
+								approval_request_id: "req-uuid-webhook-test",
+								action: "approve",
+								token_hash: tokenHash,
+								consumed_at: null,
+							},
+						],
+					});
+					vi.spyOn(supabaseModule, "getSupabaseClient").mockReturnValue(mockSupabase.mockClient as any);
+					setupTelegramFetchMock();
+
+					const req = new Request("http://localhost/api/webhooks/telegram", {
+						method: "POST",
+						headers: {
+							"Content-Type": "application/json",
+							"X-Telegram-Bot-Api-Secret-Token": "mock_webhook_secret_99999",
+						},
+						body: JSON.stringify({
+							update_id: 30001,
+							callback_query: {
+								id: "cbq_webhook_success",
+								from: { id: 123456789, is_bot: false, first_name: "Aditya" },
+								message: { message_id: 201, chat: { id: -1001234567890, type: "supergroup" }, date: Math.floor(Date.now() / 1000) },
+								data: `a:${rawToken}`,
+							},
+						}),
+					});
+
+					const response = await handleTelegramWebhook(req, mockTelegramDevEnv);
+					expect(response.status).toBe(200);
+
+					const json = await response.json() as any;
+					expect(json.success).toBe(true);
+					expect(json.decision_status).toBe("approved");
+					expect(json.action).toBe("approve");
+				});
 			});
 		});
 	});
