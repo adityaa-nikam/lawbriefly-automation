@@ -9,6 +9,7 @@ import { handleExtractTopicArticles } from "./services/topic-article-extraction"
 import { handleGenerateContent } from "./services/content-generation";
 import { handleRenderCarousel } from "./services/carousel-rendering";
 import { handleStoreCarousel } from "./services/carousel-persistence";
+import { handleNotifyEditor, handleTelegramWebhook } from "./services/editorial-approval";
 
 export interface Env {
 	LAWBRIEFLY_API_URL?: string;
@@ -22,6 +23,11 @@ export interface Env {
 	MERCURY_MODEL?: string;
 	JINA_API_KEY?: string;
 	MYBROWSER?: any;
+	TELEGRAM_BOT_TOKEN?: string;
+	TELEGRAM_CHAT_ID?: string;
+	TELEGRAM_ALLOWED_USER_IDS?: string;
+	TELEGRAM_WEBHOOK_SECRET?: string;
+	TELEGRAM_APPROVAL_TTL_HOURS?: string;
 }
 
 export default {
@@ -129,6 +135,14 @@ export default {
 
 		if (url.pathname === "/api/ai/store-carousel") {
 			return await handleStoreCarousel(request, env);
+		}
+
+		if (url.pathname === "/api/ai/notify-editor") {
+			return await handleNotifyEditor(request, env);
+		}
+
+		if (url.pathname === "/api/webhooks/telegram") {
+			return await handleTelegramWebhook(request, env);
 		}
 
 		if (url.pathname === "/api/health/supabase" && request.method === "GET") {

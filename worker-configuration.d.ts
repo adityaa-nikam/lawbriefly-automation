@@ -13,6 +13,11 @@ interface __BaseEnv_Env {
 	OPENROUTER_API_KEY: string;
 	MERCURY_MODEL: string;
 	JINA_API_KEY: string;
+	TELEGRAM_BOT_TOKEN?: string;
+	TELEGRAM_CHAT_ID?: string;
+	TELEGRAM_ALLOWED_USER_IDS?: string;
+	TELEGRAM_WEBHOOK_SECRET?: string;
+	TELEGRAM_APPROVAL_TTL_HOURS?: string;
 }
 declare namespace Cloudflare {
 	interface GlobalProps {
