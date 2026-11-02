@@ -6,3 +6,14 @@ LAWBRIEFLY_API_KEY="YOUR_LAWBRIEFLY_API_KEY"
 SUPABASE_URL="YOUR_SUPABASE_PROJECT_URL"
 SUPABASE_SECRET_KEY="YOUR_SUPABASE_SECRET_KEY"
 APP_ENV="development"
+
+# Groq Environment Variables
+GROQ_API_KEY="YOUR_GROQ_API_KEY"
+GROQ_MODEL="openai/gpt-oss-20b"
+
+# OpenRouter Mercury Environment Variables
+OPENROUTER_API_KEY="YOUR_OPENROUTER_API_KEY"
+MERCURY_MODEL="inception/mercury-decide"
+
+# Jina Reader Environment Variables
+JINA_API_KEY="YOUR_JINA_API_KEY"

@@ -1,0 +1,69 @@
+{
+  "success": true,
+  "provider": "groq",
+  "model": "openai/gpt-oss-120b",
+  "generation_status": "insufficient_evidence",
+  "generated_at": "2026-11-02T00:00:17.629Z",
+  "topic": {
+    "candidate_id": "T004",
+    "topic_title": "GST Reform: Decriminalisation and Enforcement Rationalisation",
+    "legal_domain": "tax_law",
+    "jurisdiction": "india"
+  },
+  "carousel_slide_count": 0,
+  "slides": [],
+  "timeline_events": [],
+  "content": {
+    "headline": "",
+    "summary": "",
+    "carousel_slide_count": 0,
+    "slides": [],
+    "timeline_events": [],
+    "instagram_caption": "",
+    "caption_claim_ids": [],
+    "caption_evidence": {
+      "text": "",
+      "supporting_claim_ids": []
+    },
+    "hashtags": []
+  },
+  "instagram_caption": "",
+  "caption_claim_ids": [],
+  "caption_evidence": {
+    "text": "",
+    "supporting_claim_ids": []
+  },
+  "hashtags": [],
+  "source_metrics": {
+    "requested_article_count": 1,
+    "successful_extraction_count": 1,
+    "failed_extraction_count": 0,
+    "unique_source_domain_count": 1,
+    "source_diversity_status": "single_domain"
+  },
+  "evidence": {
+    "claims": [],
+    "limitations": [
+      "Single-source topic: all factual claims are derived from a single news report (menafn.com). Independent corroboration has not been established.",
+      "The provided source article contains only an HTTP error page with no substantive content about GST reforms, decriminalisation, or trust‑based governance.",
+      "No verifiable factual claims can be extracted to support the carousel content.",
+      "Based on Council recommendations and industry reporting; operational commencement remains subject to official Gazette notification."
+    ],
+    "editorial_flags": [
+      "no_content_available",
+      "Legal status verification required: Verify whether proposed CGST Act amendments have been tabled in Parliament or notified in the official Gazette."
+    ],
+    "human_review_required": true
+  },
+  "source_attributions": [
+    {
+      "article_id": "b979a75d-676b-40f2-9ad0-cb9e7ddd59dc",
+      "original_title": "CII Hails GST Reforms As Transition To Trust-Based Governance",
+      "original_url": "https://menafn.com/1111898393/CII-Hails-GST-Reforms-As-Transition-To-Trust-Based-Governance",
+      "source_domain": "menafn.com",
+      "extraction_status": "success",
+      "content_length": 1359,
+      "paragraph_count": 5
+    }
+  ]
+}

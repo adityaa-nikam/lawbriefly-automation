@@ -1,0 +1,59 @@
+{
+  "rendered_at": "2026-11-02T01:31:03.038Z",
+  "total_slides": 5,
+  "dimensions": "1080x1350",
+  "primary_category": "tax_law",
+  "topic_title": "CII Hails GST Reforms As Transition To Trust-Based Governance",
+  "slides": [
+    {
+      "slide_number": 1,
+      "slide_role": "cover",
+      "filename": "slide-01-cover.png",
+      "dimensions": {
+        "width": 1080,
+        "height": 1350
+      },
+      "size_bytes": 335529
+    },
+    {
+      "slide_number": 2,
+      "slide_role": "what_happened",
+      "filename": "slide-02-what-happened.png",
+      "dimensions": {
+        "width": 1080,
+        "height": 1350
+      },
+      "size_bytes": 167883
+    },
+    {
+      "slide_number": 3,
+      "slide_role": "legal_details",
+      "filename": "slide-03-legal-details.png",
+      "dimensions": {
+        "width": 1080,
+        "height": 1350
+      },
+      "size_bytes": 158003
+    },
+    {
+      "slide_number": 4,
+      "slide_role": "why_it_matters",
+      "filename": "slide-04-why-it-matters.png",
+      "dimensions": {
+        "width": 1080,
+        "height": 1350
+      },
+      "size_bytes": 290044
+    },
+    {
+      "slide_number": 5,
+      "slide_role": "sources_disclaimer",
+      "filename": "slide-05-sources-disclaimer.png",
+      "dimensions": {
+        "width": 1080,
+        "height": 1350
+      },
+      "size_bytes": 138183
+    }
+  ]
+}

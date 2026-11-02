@@ -6,17 +6,27 @@
     "deploy": "wrangler deploy",
     "dev": "wrangler dev",
     "start": "wrangler dev",
-    "test": "vitest",
+    "test": "vitest run && vitest run --config vitest.node.config.mts",
+    "test:workers": "vitest run",
+    "test:renderer": "vitest run --config vitest.node.config.mts",
     "cf-typegen": "wrangler types"
   },
   "devDependencies": {
+    "@cloudflare/puppeteer": "^1.4.0",
     "@cloudflare/vitest-plugin": "^1.0.0",
     "@types/node": "^26.6.3",
+    "@types/react": "^19.3.0",
+    "@types/react-dom": "^19.3.0",
     "typescript": "^5.5.2",
     "vitest": "~4.1.0",
     "wrangler": "^4.142.0"
   },
   "dependencies": {
-    "@supabase/supabase-js": "^2.118.0"
+    "@resvg/resvg-js": "^2.6.2",
+    "@supabase/supabase-js": "^2.118.0",
+    "fflate": "^0.8.3",
+    "react": "^19.3.1",
+    "react-dom": "^19.3.1",
+    "satori": "^0.63.2"
   }
 }

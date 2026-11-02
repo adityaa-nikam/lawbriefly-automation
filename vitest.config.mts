@@ -7,4 +7,7 @@ export default defineConfig({
 			wrangler: { configPath: "./wrangler.jsonc" },
 		}),
 	],
+	test: {
+		exclude: ["test/renderer.spec.ts", "**/node_modules/**"],
+	},
 });

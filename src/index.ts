@@ -1,6 +1,13 @@
 import { fetchLawBrieflyNews } from "./services/lawbriefly";
 import { checkSupabaseHealth } from "./services/supabase";
 import { syncNewsArticles, handleScheduledNewsSync } from "./services/news-ingestion";
+import { handleGetNewsBatches } from "./services/news-retrieval";
+import { handleAnalyzeBatches } from "./services/news-analysis";
+import { handleSelectHotTopic } from "./services/topic-selection";
+import { handleExtractArticle } from "./services/article-extraction";
+import { handleExtractTopicArticles } from "./services/topic-article-extraction";
+import { handleGenerateContent } from "./services/content-generation";
+import { handleRenderCarousel } from "./services/carousel-rendering";
 
 export interface Env {
 	LAWBRIEFLY_API_URL?: string;
@@ -8,6 +15,12 @@ export interface Env {
 	SUPABASE_URL?: string;
 	SUPABASE_SECRET_KEY?: string;
 	APP_ENV?: string;
+	GROQ_API_KEY?: string;
+	GROQ_MODEL?: string;
+	OPENROUTER_API_KEY?: string;
+	MERCURY_MODEL?: string;
+	JINA_API_KEY?: string;
+	MYBROWSER?: any;
 }
 
 export default {
@@ -29,6 +42,88 @@ export default {
 				);
 			}
 			return await syncNewsArticles(env, url.searchParams);
+		}
+
+		if (url.pathname === "/api/news/batches" && request.method === "GET") {
+			if (env.APP_ENV !== "development") {
+				return new Response(
+					JSON.stringify({ error: "Not Found", status: 404 }),
+					{
+						status: 404,
+						headers: { "Content-Type": "application/json" },
+					}
+				);
+			}
+			return await handleGetNewsBatches(env, url.searchParams);
+		}
+
+		if (url.pathname === "/api/ai/analyze-batches" && request.method === "POST") {
+			if (env.APP_ENV !== "development") {
+				return new Response(
+					JSON.stringify({ error: "Not Found", status: 404 }),
+					{
+						status: 404,
+						headers: { "Content-Type": "application/json" },
+					}
+				);
+			}
+			return await handleAnalyzeBatches(env, url.searchParams);
+		}
+
+		if (url.pathname === "/api/ai/select-hot-topic" && request.method === "POST") {
+			if (env.APP_ENV !== "development") {
+				return new Response(
+					JSON.stringify({ error: "Not Found", status: 404 }),
+					{
+						status: 404,
+						headers: { "Content-Type": "application/json" },
+					}
+				);
+			}
+			return await handleSelectHotTopic(env, url.searchParams);
+		}
+
+		if (url.pathname === "/api/ai/extract-article" && request.method === "POST") {
+			if (env.APP_ENV !== "development") {
+				return new Response(
+					JSON.stringify({ error: "Not Found", status: 404 }),
+					{
+						status: 404,
+						headers: { "Content-Type": "application/json" },
+					}
+				);
+			}
+			return await handleExtractArticle(request, env);
+		}
+
+		if (url.pathname === "/api/ai/extract-topic-articles" && request.method === "POST") {
+			if (env.APP_ENV !== "development") {
+				return new Response(
+					JSON.stringify({ error: "Not Found", status: 404 }),
+					{
+						status: 404,
+						headers: { "Content-Type": "application/json" },
+					}
+				);
+			}
+			return await handleExtractTopicArticles(request, env);
+		}
+
+		if (url.pathname === "/api/ai/generate-content" && request.method === "POST") {
+			if (env.APP_ENV !== "development") {
+				return new Response(
+					JSON.stringify({ error: "Not Found", status: 404 }),
+					{
+						status: 404,
+						headers: { "Content-Type": "application/json" },
+					}
+				);
+			}
+			return await handleGenerateContent(request, env);
+		}
+
+		if (url.pathname === "/api/ai/render-carousel" && request.method === "POST") {
+			return await handleRenderCarousel(request, env);
 		}
 
 		if (url.pathname === "/api/health/supabase" && request.method === "GET") {

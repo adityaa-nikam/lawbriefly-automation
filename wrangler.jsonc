@@ -17,6 +17,9 @@
 	 */
 	"triggers": {
 		"crons": ["30 0 * * *"]
+	},
+	"browser": {
+		"binding": "MYBROWSER"
 	}
 	/**
 	 * Smart Placement
