@@ -18,6 +18,7 @@ import {
 	type InstagramPublishingJobMessage,
 } from "./services/editorial-approval";
 import { handlePublishInstagram } from "./services/instagram-publishing";
+import { handleRunPipeline } from "./services/pipeline-orchestrator";
 
 export { type InstagramPublishingJobMessage };
 
@@ -44,7 +45,10 @@ export interface Env {
 	INSTAGRAM_USER_ID?: string;
 	INSTAGRAM_GRAPH_VERSION?: string;
 	INSTAGRAM_AUTO_PUBLISH_ON_APPROVAL?: string;
+	INSTAGRAM_AUTO_PUBLISH_POST_ALLOWLIST?: string;
 	INSTAGRAM_PUBLISHING_QUEUE?: Queue<InstagramPublishingJobMessage>;
+	META_APP_ID?: string;
+	META_APP_SECRET?: string;
 }
 
 export default {
@@ -168,6 +172,10 @@ export default {
 
 		if (url.pathname === "/api/ai/recover-stranded-publications" && request.method === "POST") {
 			return await handleRecoverStrandedPublications(request, env);
+		}
+
+		if (url.pathname === "/api/ai/run-pipeline") {
+			return await handleRunPipeline(request, env);
 		}
 
 		if (url.pathname === "/api/health/supabase" && request.method === "GET") {
