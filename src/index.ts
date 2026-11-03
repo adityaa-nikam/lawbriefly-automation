@@ -9,8 +9,17 @@ import { handleExtractTopicArticles } from "./services/topic-article-extraction"
 import { handleGenerateContent } from "./services/content-generation";
 import { handleRenderCarousel } from "./services/carousel-rendering";
 import { handleStoreCarousel } from "./services/carousel-persistence";
-import { handleNotifyEditor, handleTelegramWebhook } from "./services/editorial-approval";
+import {
+	handleNotifyEditor,
+	handleTelegramWebhook,
+	handleInstagramPublishingQueue,
+	handleRecoverStrandedPublications,
+	recoverStrandedApprovedPosts,
+	type InstagramPublishingJobMessage,
+} from "./services/editorial-approval";
 import { handlePublishInstagram } from "./services/instagram-publishing";
+
+export { type InstagramPublishingJobMessage };
 
 export interface Env {
 	LAWBRIEFLY_API_URL?: string;
@@ -34,6 +43,8 @@ export interface Env {
 	INSTAGRAM_ACCOUNT_ID?: string;
 	INSTAGRAM_USER_ID?: string;
 	INSTAGRAM_GRAPH_VERSION?: string;
+	INSTAGRAM_AUTO_PUBLISH_ON_APPROVAL?: string;
+	INSTAGRAM_PUBLISHING_QUEUE?: Queue<InstagramPublishingJobMessage>;
 }
 
 export default {
@@ -148,11 +159,15 @@ export default {
 		}
 
 		if (url.pathname === "/api/webhooks/telegram") {
-			return await handleTelegramWebhook(request, env);
+			return await handleTelegramWebhook(request, env, ctx);
 		}
 
 		if (url.pathname === "/api/ai/publish-instagram") {
 			return await handlePublishInstagram(request, env);
+		}
+
+		if (url.pathname === "/api/ai/recover-stranded-publications" && request.method === "POST") {
+			return await handleRecoverStrandedPublications(request, env);
 		}
 
 		if (url.pathname === "/api/health/supabase" && request.method === "GET") {
@@ -181,7 +196,16 @@ export default {
 		);
 	},
 
+	async queue(batch: MessageBatch<any>, env: Env, ctx: ExecutionContext): Promise<void> {
+		await handleInstagramPublishingQueue(batch, env, ctx);
+	},
+
 	async scheduled(controller: ScheduledController, env: Env, ctx: ExecutionContext): Promise<void> {
 		await handleScheduledNewsSync(controller, env);
+		if (env.INSTAGRAM_AUTO_PUBLISH_ON_APPROVAL === "true") {
+			await recoverStrandedApprovedPosts(env).catch((err) => {
+				console.error("[Scheduled] Stranded approved posts recovery error:", err);
+			});
+		}
 	},
 } satisfies ExportedHandler<Env>;

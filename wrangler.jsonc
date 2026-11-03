@@ -20,6 +20,28 @@
 	},
 	"browser": {
 		"binding": "MYBROWSER"
+	},
+	/**
+	 * Cloudflare Queues for Asynchronous Instagram Publishing (Task 18.2)
+	 */
+	"queues": {
+		"producers": [
+			{
+				"binding": "INSTAGRAM_PUBLISHING_QUEUE",
+				"queue": "instagram-publishing-jobs"
+			}
+		],
+		"consumers": [
+			{
+				"queue": "instagram-publishing-jobs",
+				"max_batch_size": 1,
+				"max_batch_timeout": 5,
+				"max_retries": 3,
+				"retry_delay": 30,
+				"dead_letter_queue": "instagram-publishing-dlq",
+				"max_concurrency": 1
+			}
+		]
 	}
 	/**
 	 * Smart Placement

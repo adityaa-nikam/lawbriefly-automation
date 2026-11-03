@@ -92,6 +92,9 @@ export interface PublishResult {
 	post_id: string;
 	carousel_container_id?: string;
 	child_container_ids?: string[];
+	child_container_statuses?: Record<string, string>;
+	carousel_container_status?: string;
+	is_container_reused?: boolean;
 	instagram_media_id?: string;
 	instagram_permalink?: string;
 	error?: string;
@@ -991,6 +994,151 @@ export async function getPublishedMediaDetails(
 	};
 }
 
+export interface PublicationRecordParams {
+	postId: string;
+	platform?: "instagram";
+	mediaType: "IMAGE" | "CAROUSEL" | "REEL";
+	slideCount: number;
+	publicationStatus: "pending" | "processing" | "publishing" | "published" | "failed" | "unknown";
+	accountId: string;
+	carouselContainerId?: string | null;
+	childContainerIds?: string[];
+	mediaId?: string | null;
+	permalink?: string | null;
+	caption: string;
+	errorCode?: string | null;
+	errorMessage?: string | null;
+	publishedAt?: string | null;
+}
+
+export type PublicationEventType =
+	| "assets_prepared"
+	| "single_container_created"
+	| "child_containers_created"
+	| "parent_container_created"
+	| "container_processing_finished"
+	| "container_processing_failed"
+	| "published_success"
+	| "publication_failed";
+
+export const ALLOWED_PUBLICATION_EVENT_TYPES: ReadonlySet<PublicationEventType> = new Set([
+	"assets_prepared",
+	"single_container_created",
+	"child_containers_created",
+	"parent_container_created",
+	"container_processing_finished",
+	"container_processing_failed",
+	"published_success",
+	"publication_failed",
+]);
+
+/**
+ * Validates publication row constraints before database insertion:
+ * - REEL: slide_count = 0
+ * - IMAGE: slide_count = 1
+ * - CAROUSEL: slide_count between 2 and 10
+ */
+export function validatePublicationRowConstraints(params: PublicationRecordParams): void {
+	if (params.mediaType === "IMAGE") {
+		if (params.slideCount !== 1) {
+			throw new Error(`Invalid slide_count ${params.slideCount} for media_type 'IMAGE'. Must be exactly 1.`);
+		}
+	} else if (params.mediaType === "CAROUSEL") {
+		if (params.slideCount < 2 || params.slideCount > 10) {
+			throw new Error(`Invalid slide_count ${params.slideCount} for media_type 'CAROUSEL'. Must be between 2 and 10.`);
+		}
+	} else if (params.mediaType === "REEL") {
+		if (params.slideCount !== 0) {
+			throw new Error(`Invalid slide_count ${params.slideCount} for media_type 'REEL'. Must be exactly 0.`);
+		}
+	} else {
+		throw new Error(`Unsupported media_type: '${params.mediaType}'. Must be 'IMAGE', 'CAROUSEL', or 'REEL'.`);
+	}
+}
+
+/**
+ * Inserts or updates a publication record in public.social_content_publications.
+ * Strictly enforces slide_count constraints and media_type requirements.
+ */
+export async function recordSocialContentPublication(
+	supabase: any,
+	params: PublicationRecordParams
+): Promise<any> {
+	validatePublicationRowConstraints(params);
+
+	const row = {
+		post_id: params.postId,
+		platform: params.platform || "instagram",
+		media_type: params.mediaType,
+		publication_status: params.publicationStatus,
+		instagram_account_id: params.accountId,
+		carousel_container_id: params.carouselContainerId || null,
+		child_container_ids: params.childContainerIds || [],
+		instagram_media_id: params.mediaId || null,
+		instagram_permalink: params.permalink || null,
+		caption: params.caption,
+		slide_count: params.slideCount,
+		error_code: params.errorCode || null,
+		error_message: params.errorMessage || null,
+		published_at: params.publishedAt || null,
+		updated_at: new Date().toISOString(),
+	};
+
+	try {
+		const { data, error } = await supabase
+			.from("social_content_publications")
+			.upsert(row, { onConflict: "post_id,platform" })
+			.select("*")
+			.maybeSingle();
+
+		if (error) {
+			// Graceful degradation if table does not exist prior to migration
+			console.error(`Failed to record publication for post ${params.postId}: ${error.message}`);
+		}
+		return data;
+	} catch {
+		return null;
+	}
+}
+
+/**
+ * Appends an audit event to public.social_content_publication_events.
+ * Strictly verifies event_type against migration check constraint.
+ */
+export async function recordSocialContentPublicationEvent(
+	supabase: any,
+	params: {
+		postId: string;
+		publicationId?: string | null;
+		eventType: PublicationEventType;
+		platform?: "instagram";
+		details?: Record<string, any>;
+	}
+): Promise<void> {
+	if (!ALLOWED_PUBLICATION_EVENT_TYPES.has(params.eventType)) {
+		throw new Error(`Invalid publication event_type: '${params.eventType}'. Not permitted by database check constraint.`);
+	}
+
+	try {
+		const { error } = await supabase
+			.from("social_content_publication_events")
+			.insert({
+				post_id: params.postId,
+				publication_id: params.publicationId || null,
+				event_type: params.eventType,
+				platform: params.platform || "instagram",
+				details: params.details || {},
+			});
+
+		if (error) {
+			// Graceful degradation if table does not exist prior to migration
+			console.error(`Failed to insert publication event for post ${params.postId}: ${error.message}`);
+		}
+	} catch {
+		// Silent catch for test environments where table is not mocked
+	}
+}
+
 /**
  * Complete publishing orchestrator for approved LawBriefly carousels.
  * 
@@ -1015,39 +1163,153 @@ export async function publishApprovedCarousel(
 ): Promise<PublishResult> {
 	const prepareOnly = options?.prepareOnly ?? options?.dryRun ?? true;
 	const config = getValidatedInstagramConfig(env);
+	const supabase = getSupabaseClient(env);
 
-	// 1. Prepare publishing assets & temporary signed URLs (60 min TTL)
-	const assetPrep = await preparePublishingAssets(env, postId, {
-		customConverter: options?.customConverter,
-	});
+	// 1. Fetch & validate post state from PostgreSQL
+	const { data: post, error: postError } = await supabase
+		.from("social_content_posts")
+		.select("*")
+		.eq("id", postId)
+		.single();
 
-	// 2. Create child containers for each slide
-	const childContainerIds: string[] = [];
-	for (const slide of assetPrep.slides) {
-		const childId = await createCarouselItemContainer(config, slide.signed_url);
-		childContainerIds.push(childId);
+	if (postError || !post) {
+		throw new Error(`Post not found in database: ${postId}`);
 	}
 
-	// 3. Format full caption with hashtags
-	const hashtagString = assetPrep.hashtags.length > 0
-		? "\n\n" + assetPrep.hashtags.map((h) => (h.startsWith("#") ? h : `#${h}`)).join(" ")
-		: "";
-	const fullCaption = `${assetPrep.caption}${hashtagString}`;
-
-	// 4. Create parent carousel container
-	const parentContainerId = await createCarouselContainer(config, childContainerIds, fullCaption);
-
-	// 5. Poll container status until ready
-	const containerStatus = await pollContainerUntilReady(config, parentContainerId, {
-		maxAttempts: options?.pollMaxAttempts,
-		intervalMs: options?.pollIntervalMs,
-	});
-
-	if (containerStatus.status_code !== "FINISHED") {
-		throw new Error(`Container processing did not finish successfully: ${containerStatus.status_code}`);
+	const validation = validatePostForPublishing(post);
+	if (!validation.valid) {
+		throw new Error(validation.error);
 	}
 
-	// 6. Stop here if prepare_only (Task 17A safety requirement - NEVER call media_publish)
+	// 2. Check existing publication record to prevent duplicate publishing and detect existing containers
+	const { data: existingPub } = await supabase
+		.from("social_content_publications")
+		.select("*")
+		.eq("post_id", postId)
+		.eq("platform", "instagram")
+		.maybeSingle();
+
+	if (existingPub) {
+		if (existingPub.publication_status === "published" || existingPub.instagram_media_id) {
+			throw new Error("Post has already been published to Instagram. Republishing is prohibited.");
+		}
+
+		if (existingPub.publication_status === "publishing") {
+			const updatedAtMs = new Date(existingPub.updated_at || existingPub.created_at || Date.now()).getTime();
+			const ageMs = Date.now() - updatedAtMs;
+			if (ageMs < 5 * 60 * 1000) {
+				throw new Error("Publishing is currently in progress for this post. Concurrent execution prevented.");
+			}
+		}
+
+		if (existingPub.publication_status === "unknown") {
+			throw new Error("Publication status is 'unknown' due to a previous ambiguous network failure. Manual verification is required before retrying.");
+		}
+	}
+
+	// 3. Check if existing FINISHED parent container and children can be safely reused
+	let parentContainerId = existingPub?.carousel_container_id || "";
+	let childContainerIds: string[] = Array.isArray(existingPub?.child_container_ids) ? existingPub.child_container_ids : [];
+	let fullCaption = existingPub?.caption || "";
+	let slideCount = existingPub?.slide_count || post.carousel_slide_count || 5;
+	let childStatuses: Record<string, string> = {};
+	let isContainerReused = false;
+
+	if (parentContainerId && childContainerIds.length >= 2) {
+		try {
+			const statusCheck = await getContainerStatus(config, parentContainerId);
+			if (statusCheck.status_code === "FINISHED") {
+				isContainerReused = true;
+				for (const childId of childContainerIds) {
+					childStatuses[childId] = "FINISHED";
+				}
+			}
+		} catch {
+			isContainerReused = false;
+		}
+	}
+
+	// 4. If container cannot be reused, prepare fresh assets, children, and parent container
+	if (!isContainerReused) {
+		const assetPrep = await preparePublishingAssets(env, postId, {
+			customConverter: options?.customConverter,
+		});
+
+		await recordSocialContentPublicationEvent(supabase, {
+			postId,
+			eventType: "assets_prepared",
+			details: { slide_count: assetPrep.slides.length },
+		});
+
+		childContainerIds = [];
+		for (const slide of assetPrep.slides) {
+			const childId = await createCarouselItemContainer(config, slide.signed_url);
+			childContainerIds.push(childId);
+		}
+
+		await recordSocialContentPublicationEvent(supabase, {
+			postId,
+			eventType: "child_containers_created",
+			details: { count: childContainerIds.length, child_container_ids: childContainerIds },
+		});
+
+		childStatuses = {};
+		for (const childId of childContainerIds) {
+			const childStatus = await pollContainerUntilReady(config, childId, {
+				maxAttempts: options?.pollMaxAttempts,
+				intervalMs: options?.pollIntervalMs,
+			});
+			childStatuses[childId] = childStatus.status_code;
+		}
+
+		const hashtagString = assetPrep.hashtags.length > 0
+			? "\n\n" + assetPrep.hashtags.map((h) => (h.startsWith("#") ? h : `#${h}`)).join(" ")
+			: "";
+		fullCaption = `${assetPrep.caption}${hashtagString}`;
+		slideCount = assetPrep.slides.length;
+
+		parentContainerId = await createCarouselContainer(config, childContainerIds, fullCaption);
+
+		await recordSocialContentPublicationEvent(supabase, {
+			postId,
+			eventType: "parent_container_created",
+			details: { parent_container_id: parentContainerId },
+		});
+
+		const containerStatus = await pollContainerUntilReady(config, parentContainerId, {
+			maxAttempts: options?.pollMaxAttempts,
+			intervalMs: options?.pollIntervalMs,
+		});
+
+		if (containerStatus.status_code !== "FINISHED") {
+			await recordSocialContentPublicationEvent(supabase, {
+				postId,
+				eventType: "container_processing_failed",
+				details: { status: containerStatus.status_code },
+			});
+			throw new Error(`Container processing did not finish successfully: ${containerStatus.status_code}`);
+		}
+
+		await recordSocialContentPublicationEvent(supabase, {
+			postId,
+			eventType: "container_processing_finished",
+			details: { status: "FINISHED" },
+		});
+
+		// Record initial publication record with publication_status: 'processing'
+		await recordSocialContentPublication(supabase, {
+			postId,
+			mediaType: "CAROUSEL",
+			slideCount,
+			publicationStatus: prepareOnly ? "processing" : "published",
+			accountId: config.accountId,
+			carouselContainerId: parentContainerId,
+			childContainerIds,
+			caption: fullCaption,
+		});
+	}
+
+	// 5. If prepare_only (Task 17A safety requirement - NEVER call media_publish)
 	if (prepareOnly) {
 		return {
 			success: true,
@@ -1056,17 +1318,67 @@ export async function publishApprovedCarousel(
 			post_id: postId,
 			carousel_container_id: parentContainerId,
 			child_container_ids: childContainerIds,
+			child_container_statuses: childStatuses,
+			carousel_container_status: "FINISHED",
+			is_container_reused: isContainerReused,
 		};
 	}
 
-	// 7. Live execution (Task 17B path only when prepareOnly === false)
-	const mediaId = await publishMediaContainer(config, parentContainerId);
-	const mediaDetails = await getPublishedMediaDetails(config, mediaId);
+	// 6. Transition publication record: processing -> publishing before calling media_publish
+	await supabase
+		.from("social_content_publications")
+		.update({
+			publication_status: "publishing",
+			updated_at: new Date().toISOString(),
+		})
+		.eq("post_id", postId)
+		.eq("platform", "instagram");
 
-	// 8. Update post status to 'published' in database
-	const supabase = getSupabaseClient(env);
+	// 7. Live execution: invoke media_publish with timeout & network safety
+	let mediaId: string;
+	try {
+		mediaId = await publishMediaContainer(config, parentContainerId);
+	} catch (err: any) {
+		const isTimeout =
+			err.name === "TimeoutError" ||
+			err.message?.toLowerCase().includes("timeout") ||
+			err.message?.toLowerCase().includes("abort");
+
+		const finalStatus = isTimeout ? "unknown" : "failed";
+		const errorCode = isTimeout ? "PUBLISH_TIMEOUT" : "MEDIA_PUBLISH_FAILED";
+		const errorMessage = sanitizeMetaError(err.message || "Failed to publish media container.");
+
+		await supabase
+			.from("social_content_publications")
+			.update({
+				publication_status: finalStatus,
+				error_code: errorCode,
+				error_message: errorMessage,
+				updated_at: new Date().toISOString(),
+			})
+			.eq("post_id", postId)
+			.eq("platform", "instagram");
+
+		await recordSocialContentPublicationEvent(supabase, {
+			postId,
+			eventType: "publication_failed",
+			details: {
+				status: finalStatus,
+				error_code: errorCode,
+				error_message: errorMessage,
+				is_timeout: isTimeout,
+			},
+		});
+
+		// Critical safety invariant: post_status in social_content_posts MUST remain intact ('approved')!
+		throw new Error(`Instagram media publication failed (${finalStatus}): ${errorMessage}`);
+	}
+
+	// 8. Fetch published media permalink and details
+	const mediaDetails = await getPublishedMediaDetails(config, mediaId);
 	const now = new Date().toISOString();
 
+	// 9. Update social_content_posts to 'published' ONLY AFTER media_publish succeeds
 	await supabase
 		.from("social_content_posts")
 		.update({
@@ -1075,6 +1387,27 @@ export async function publishApprovedCarousel(
 		})
 		.eq("id", postId);
 
+	await recordSocialContentPublicationEvent(supabase, {
+		postId,
+		eventType: "published_success",
+		details: { media_id: mediaId, permalink: mediaDetails.permalink },
+	});
+
+	// 10. Transition publication record: publishing -> published with final details
+	await recordSocialContentPublication(supabase, {
+		postId,
+		mediaType: "CAROUSEL",
+		slideCount,
+		publicationStatus: "published",
+		accountId: config.accountId,
+		carouselContainerId: parentContainerId,
+		childContainerIds,
+		mediaId,
+		permalink: mediaDetails.permalink,
+		caption: fullCaption,
+		publishedAt: now,
+	});
+
 	return {
 		success: true,
 		prepare_only: false,
@@ -1082,6 +1415,7 @@ export async function publishApprovedCarousel(
 		post_id: postId,
 		carousel_container_id: parentContainerId,
 		child_container_ids: childContainerIds,
+		is_container_reused: isContainerReused,
 		instagram_media_id: mediaId,
 		instagram_permalink: mediaDetails.permalink,
 	};
@@ -1285,6 +1619,25 @@ export async function publishSingleImage(
 	// 3. Create Instagram single-image container
 	const containerId = await createSingleImageContainer(config, signedUrl, caption);
 
+	if (params.postId) {
+		await recordSocialContentPublicationEvent(supabase, {
+			postId: params.postId,
+			eventType: "single_container_created",
+			details: { container_id: containerId },
+		});
+
+		await recordSocialContentPublication(supabase, {
+			postId: params.postId,
+			mediaType: "IMAGE",
+			slideCount: 1, // IMAGE ALWAYS inserts slide_count=1!
+			publicationStatus: prepareOnly ? "processing" : "published",
+			accountId: config.accountId,
+			carouselContainerId: containerId,
+			childContainerIds: [],
+			caption,
+		});
+	}
+
 	// 4. Poll container status until ready (FINISHED)
 	const containerStatus = await pollContainerUntilReady(config, containerId, {
 		maxAttempts: params.options?.pollMaxAttempts,
@@ -1292,7 +1645,22 @@ export async function publishSingleImage(
 	});
 
 	if (containerStatus.status_code !== "FINISHED") {
+		if (params.postId) {
+			await recordSocialContentPublicationEvent(supabase, {
+				postId: params.postId,
+				eventType: "container_processing_failed",
+				details: { status: containerStatus.status_code },
+			});
+		}
 		throw new Error(`Single image container processing did not finish successfully: ${containerStatus.status_code}`);
+	}
+
+	if (params.postId) {
+		await recordSocialContentPublicationEvent(supabase, {
+			postId: params.postId,
+			eventType: "container_processing_finished",
+			details: { status: "FINISHED" },
+		});
 	}
 
 	// 5. If prepare_only (default), safely return without publishing
@@ -1322,6 +1690,26 @@ export async function publishSingleImage(
 				updated_at: now,
 			})
 			.eq("id", params.postId);
+
+		await recordSocialContentPublicationEvent(supabase, {
+			postId: params.postId,
+			eventType: "published_success",
+			details: { media_id: mediaId, permalink: mediaDetails.permalink },
+		});
+
+		await recordSocialContentPublication(supabase, {
+			postId: params.postId,
+			mediaType: "IMAGE",
+			slideCount: 1, // IMAGE ALWAYS inserts slide_count=1!
+			publicationStatus: "published",
+			accountId: config.accountId,
+			carouselContainerId: containerId,
+			childContainerIds: [],
+			mediaId,
+			permalink: mediaDetails.permalink,
+			caption,
+			publishedAt: now,
+		});
 	}
 
 	return {

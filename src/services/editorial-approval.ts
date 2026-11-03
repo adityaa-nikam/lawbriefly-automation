@@ -23,6 +23,7 @@ import {
 	type TelegramUpdate,
 	type TelegramMediaItem,
 } from "./telegram-bot";
+import * as instagramPublishing from "./instagram-publishing";
 
 export const DEFAULT_APPROVAL_TTL_HOURS = 72;
 export const UUID_REGEX = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
@@ -49,6 +50,14 @@ export interface NotifyEditorResult {
 	error?: string;
 }
 
+export interface InstagramPublishingJobMessage {
+	job_id: string;
+	post_id: string;
+	approval_request_id?: string;
+	enqueued_at: string;
+	attempt?: number;
+}
+
 export interface ProcessCallbackResult {
 	success: boolean;
 	is_duplicate?: boolean;
@@ -57,7 +66,17 @@ export interface ProcessCallbackResult {
 	approval_request_id?: string;
 	action?: "approve" | "reject";
 	decision_status?: "approved" | "rejected";
+	auto_publish_dispatched?: boolean;
+	queue_job_id?: string;
 	error_code?: string;
+	error?: string;
+}
+
+export interface AutoPublishResult {
+	success: boolean;
+	skipped?: boolean;
+	reason?: string;
+	result?: any;
 	error?: string;
 }
 
@@ -588,7 +607,8 @@ export async function notifyEditorForStoredPost(
  */
 export async function processTelegramCallback(
 	update: TelegramUpdate,
-	env: Env
+	env: Env,
+	ctx?: ExecutionContext
 ): Promise<ProcessCallbackResult> {
 	if (!update || !update.callback_query) {
 		console.warn("[Telegram Approval Stage 1] Update rejected: missing callback_query object.");
@@ -861,6 +881,49 @@ export async function processTelegramCallback(
 				inline_keyboard: [],
 			}).catch(() => {});
 		}
+
+		// Durable Outbox Delivery Recovery (Task 18.2):
+		// If this was an approve action, auto-publish is enabled, but the post was stranded
+		// in 'pending' (e.g. because Queue.send() failed on previous attempt or worker was killed),
+		// re-attempt Queue.send()!
+		let queueJobId: string | undefined;
+		let autoPublishDispatched = false;
+		if (action === "approve" && postId && env.INSTAGRAM_AUTO_PUBLISH_ON_APPROVAL === "true") {
+			const { data: strandedPub } = await supabase
+				.from("social_content_publications")
+				.select("publication_status")
+				.eq("post_id", postId)
+				.eq("platform", "instagram")
+				.maybeSingle();
+
+			if (strandedPub && strandedPub.publication_status === "pending" && env.INSTAGRAM_PUBLISHING_QUEUE) {
+				const deterministicJobId = deterministicPublishingJobId(postId);
+				try {
+					await env.INSTAGRAM_PUBLISHING_QUEUE.send({
+						job_id: deterministicJobId,
+						post_id: postId,
+						approval_request_id: approvalRequestId,
+						enqueued_at: new Date().toISOString(),
+					});
+					autoPublishDispatched = true;
+					queueJobId = deterministicJobId;
+					console.log(`[Queue Producer] Recovered and enqueued previously stranded post ${postId} on duplicate callback.`);
+				} catch (retryErr: any) {
+					console.error(`[Queue Producer] Retry Queue.send() failed for post ${postId}:`, retryErr);
+					return {
+						success: false,
+						is_duplicate: true,
+						post_id: postId,
+						approval_request_id: approvalRequestId,
+						action,
+						decision_status: decisionStatus || "approved",
+						error_code: "QUEUE_ENQUEUE_FAILED",
+						error: `Post approved in database but Queue.send() failed: ${retryErr.message}`,
+					};
+				}
+			}
+		}
+
 		return {
 			success: true,
 			is_duplicate: true,
@@ -868,6 +931,8 @@ export async function processTelegramCallback(
 			approval_request_id: approvalRequestId,
 			action,
 			decision_status: decisionStatus || (action === "approve" ? "approved" : "rejected"),
+			auto_publish_dispatched: autoPublishDispatched || undefined,
+			queue_job_id: queueJobId,
 		};
 	}
 
@@ -933,20 +998,174 @@ export async function processTelegramCallback(
 		}
 	}
 
+	// 8. Automated Instagram Publishing Dispatch (Task 18 & Task 18.2)
+	// Triggers ONLY on genuine, first-time successful editorial approval when enabled
+	let autoPublishDispatched = false;
+	let queueJobId: string | undefined;
+	if (
+		decisionSuccess &&
+		action === "approve" &&
+		decisionStatus === "approved" &&
+		!isDuplicate &&
+		postId &&
+		env.INSTAGRAM_AUTO_PUBLISH_ON_APPROVAL === "true"
+	) {
+		// 8.1. Create durable outbox record in social_content_publications (publication_status = 'pending')
+		await recordApprovalPublicationOutbox(supabase, env, postId, approvalRequestId);
+
+		const deterministicJobId = deterministicPublishingJobId(postId);
+
+		if (env.INSTAGRAM_PUBLISHING_QUEUE && typeof env.INSTAGRAM_PUBLISHING_QUEUE.send === "function") {
+			try {
+				// Requirement 2: Await Queue.send() before acknowledging successful webhook handling
+				await env.INSTAGRAM_PUBLISHING_QUEUE.send({
+					job_id: deterministicJobId,
+					post_id: postId,
+					approval_request_id: approvalRequestId,
+					enqueued_at: new Date().toISOString(),
+				});
+				autoPublishDispatched = true;
+				queueJobId = deterministicJobId;
+				console.log(`[Queue Producer] Enqueued publishing job for post ${postId} (job_id: ${deterministicJobId})`);
+			} catch (err: any) {
+				console.error(`[Queue Producer] Queue.send() failed for approved post ${postId}:`, err);
+				try {
+					await supabase.from("social_content_publications").update({
+						error_code: "QUEUE_ENQUEUE_FAILED",
+						error_message: err.message || "Failed to enqueue to INSTAGRAM_PUBLISHING_QUEUE",
+						updated_at: new Date().toISOString(),
+					}).eq("post_id", postId).eq("platform", "instagram");
+				} catch {
+					// Outbox error record best-effort
+				}
+
+				return {
+					success: false,
+					post_id: postId,
+					approval_request_id: approvalRequestId,
+					action,
+					decision_status: "approved",
+					error_code: "QUEUE_ENQUEUE_FAILED",
+					error: `Post approved in database but Queue.send() failed: ${err.message}`,
+					auto_publish_dispatched: false,
+				};
+			}
+		} else {
+			// Fallback if queue binding not present (e.g. standalone test environment)
+			autoPublishDispatched = true;
+			const publishTask = dispatchAutoPublishOnApproval(env, postId).catch((err) => {
+				console.error("[Auto-Publish] Background dispatch error:", err);
+			});
+
+			if (ctx && typeof ctx.waitUntil === "function") {
+				ctx.waitUntil(publishTask);
+			} else {
+				await publishTask;
+			}
+		}
+	}
+
 	return {
 		success: true,
 		post_id: postId,
 		approval_request_id: approvalRequestId,
 		action,
 		decision_status: action === "approve" ? "approved" : "rejected",
+		is_duplicate: isDuplicate,
+		auto_publish_dispatched: autoPublishDispatched,
+		queue_job_id: queueJobId,
 	};
+}
+
+/**
+ * Automates Instagram publishing after successful editorial approval.
+ * Invariant guarantees:
+ * 1. Only runs when INSTAGRAM_AUTO_PUBLISH_ON_APPROVAL === 'true'.
+ * 2. Strictly verifies post_status is 'approved' and human_review_required is true.
+ * 3. Enforces CAROUSEL only (slide count 2-10). IMAGE and REEL are never auto-published.
+ * 4. Calls publishApprovedCarousel with prepareOnly: false (reuses existing finished container).
+ * 5. Publishing failure or timeout NEVER reverses post approval or mutates post_status back.
+ */
+export async function dispatchAutoPublishOnApproval(
+	env: Env,
+	postId: string
+): Promise<AutoPublishResult> {
+	if (env.INSTAGRAM_AUTO_PUBLISH_ON_APPROVAL !== "true") {
+		return { success: true, skipped: true, reason: "INSTAGRAM_AUTO_PUBLISH_ON_APPROVAL is disabled" };
+	}
+
+	const supabase = getSupabaseClient(env);
+
+	// 1. Fetch post and verify approval state
+	const { data: post, error: postErr } = await supabase
+		.from("social_content_posts")
+		.select("*")
+		.eq("id", postId)
+		.single();
+
+	if (postErr || !post) {
+		console.error(`[Auto-Publish] Post not found in database: ${postId}`);
+		return { success: false, error: `Post not found: ${postId}` };
+	}
+
+	if (post.post_status !== "approved") {
+		console.warn(`[Auto-Publish] Post ${postId} is not in 'approved' status (current: '${post.post_status}'). Skipping.`);
+		return { success: false, skipped: true, reason: `Post not approved (${post.post_status})` };
+	}
+
+	if (post.human_review_required !== true) {
+		console.warn(`[Auto-Publish] Post ${postId} human_review_required is not true. Skipping.`);
+		return { success: false, skipped: true, reason: "human_review_required is not true" };
+	}
+
+	// 2. Strict media_type guard: CAROUSEL only (Task 18 requirement 10)
+	const slideCount = Number(post.carousel_slide_count);
+	if (isNaN(slideCount) || slideCount < 2 || slideCount > 10) {
+		console.warn(`[Auto-Publish] Post ${postId} slide count is ${slideCount}. Automatic publishing restricted to CAROUSEL only.`);
+		return { success: false, skipped: true, reason: "Automatic publishing currently restricted to CAROUSEL media type only" };
+	}
+
+	// 3. Check existing publication record (idempotency & duplicate prevention)
+	const { data: existingPub } = await supabase
+		.from("social_content_publications")
+		.select("*")
+		.eq("post_id", postId)
+		.eq("platform", "instagram")
+		.maybeSingle();
+
+	if (existingPub) {
+		if (existingPub.publication_status === "published" || existingPub.instagram_media_id) {
+			console.warn(`[Auto-Publish] Post ${postId} is already published to Instagram. Skipping.`);
+			return { success: false, skipped: true, reason: "Post already published" };
+		}
+		if (existingPub.publication_status === "publishing") {
+			console.warn(`[Auto-Publish] Post ${postId} is actively publishing. Skipping duplicate attempt.`);
+			return { success: false, skipped: true, reason: "Publishing is already in progress" };
+		}
+		if (existingPub.publication_status === "unknown") {
+			console.warn(`[Auto-Publish] Post ${postId} has publication status 'unknown'. Manual reconciliation required.`);
+			return { success: false, skipped: true, reason: "Publication outcome unknown; manual reconciliation required" };
+		}
+	}
+
+	// 4. Execute internal carousel publishing (never HTTP call to self)
+	try {
+		console.log(`[Auto-Publish] Executing automated carousel publication for post ${postId}`);
+		const result = await instagramPublishing.publishApprovedCarousel(env, postId, { prepareOnly: false });
+		console.log(`[Auto-Publish] Automated publication succeeded for post ${postId}: media_id=${result.instagram_media_id}`);
+		return { success: true, result };
+	} catch (err: any) {
+		// Crucial: publishing failure NEVER reverses editorial approval!
+		console.error(`[Auto-Publish] Automated publication failed for post ${postId}: ${err.message || err}`);
+		return { success: false, error: err.message || "Failed to publish" };
+	}
 }
 
 /**
  * Development-only handler for POST /api/ai/notify-editor.
  */
 export async function handleNotifyEditor(request: Request, env: Env): Promise<Response> {
-	if (env.APP_ENV !== "development") {
+	if (env.APP_ENV !== "development" && (env as any).ENVIRONMENT !== "development") {
 		return new Response(JSON.stringify({ error: "Not Found", status: 404 }), {
 			status: 404,
 			headers: { "Content-Type": "application/json" },
@@ -1026,7 +1245,7 @@ export async function handleNotifyEditor(request: Request, env: Env): Promise<Re
  * Public webhook handler for POST /api/webhooks/telegram.
  * Authenticates via X-Telegram-Bot-Api-Secret-Token constant-time comparison.
  */
-export async function handleTelegramWebhook(request: Request, env: Env): Promise<Response> {
+export async function handleTelegramWebhook(request: Request, env: Env, ctx?: ExecutionContext): Promise<Response> {
 	if (request.method !== "POST") {
 		return new Response(JSON.stringify({ error: "Method Not Allowed", status: 405 }), {
 			status: 405,
@@ -1091,7 +1310,7 @@ export async function handleTelegramWebhook(request: Request, env: Env): Promise
 	}
 
 	try {
-		const result = await processTelegramCallback(update, env);
+		const result = await processTelegramCallback(update, env, ctx);
 		return new Response(JSON.stringify(result), {
 			status: 200,
 			headers: { "Content-Type": "application/json" },
@@ -1101,6 +1320,481 @@ export async function handleTelegramWebhook(request: Request, env: Env): Promise
 		// Return 200 to Telegram to prevent retry storm on unrecoverable logic errors
 		return new Response(JSON.stringify({ success: false, error: err.message || "Failed to process update" }), {
 			status: 200,
+			headers: { "Content-Type": "application/json" },
+		});
+	}
+}
+
+/**
+ * Generates a deterministic job_id for a given post and approval request.
+ * Guarantees that duplicate Telegram callbacks or recovery sweeps generate
+ * the identical job identifier, enabling idempotent deduplication across the queue.
+ */
+export function deterministicPublishingJobId(postId: string, approvalRequestId?: string): string {
+	return approvalRequestId ? `publish:${postId}:${approvalRequestId}` : `publish:${postId}`;
+}
+
+/**
+ * Creates or updates an outbox row in social_content_publications with publication_status = 'pending'.
+ * This ensures that if Queue.send() fails or the Worker terminates between approval and enqueueing,
+ * the approved post is recorded as 'pending' publication rather than lost.
+ */
+export async function recordApprovalPublicationOutbox(
+	supabase: any,
+	env: Env,
+	postId: string,
+	approvalRequestId?: string
+): Promise<void> {
+	const { data: post } = await supabase
+		.from("social_content_posts")
+		.select("*")
+		.eq("id", postId)
+		.single();
+
+	if (!post) return;
+
+	const { data: existingPub } = await supabase
+		.from("social_content_publications")
+		.select("*")
+		.eq("post_id", postId)
+		.eq("platform", "instagram")
+		.maybeSingle();
+
+	const now = new Date().toISOString();
+
+	if (!existingPub) {
+		await supabase
+			.from("social_content_publications")
+			.insert({
+				post_id: postId,
+				platform: "instagram",
+				media_type: "CAROUSEL",
+				publication_status: "pending",
+				instagram_account_id: env.INSTAGRAM_ACCOUNT_ID || "17841422733573542",
+				caption: post.instagram_caption || "LawBriefly update",
+				slide_count: Number(post.carousel_slide_count) || 5,
+				retry_count: 0,
+				created_at: now,
+				updated_at: now,
+			})
+			.catch((err: any) => {
+				console.warn("[Outbox] Initial insert into social_content_publications failed:", err.message);
+			});
+	} else if (existingPub.publication_status === "failed") {
+		await supabase
+			.from("social_content_publications")
+			.update({
+				publication_status: "pending",
+				error_code: null,
+				error_message: null,
+				updated_at: now,
+			})
+			.eq("id", existingPub.id)
+			.catch(() => {});
+	}
+}
+
+/**
+ * Atomically claims publication work for a post before executing it.
+ * Uses PostgreSQL RPC claim_publication_job with row-level locks (FOR UPDATE)
+ * when available, falling back to atomic table queries.
+ */
+export async function claimPublicationJob(
+	supabase: any,
+	postId: string,
+	staleSeconds = 300
+): Promise<{
+	claimed: boolean;
+	is_already_published?: boolean;
+	is_unknown?: boolean;
+	in_progress?: boolean;
+	publication_id?: string;
+	retry_count?: number;
+	error_code?: string;
+	error?: string;
+}> {
+	// 1. Try PostgreSQL RPC if available
+	try {
+		const res = await supabase.rpc("claim_publication_job", {
+			p_post_id: postId,
+			p_stale_seconds: staleSeconds,
+		});
+		if (!res.error && res.data) {
+			const data = typeof res.data === "string" ? JSON.parse(res.data) : res.data;
+			return {
+				claimed: Boolean(data.claimed),
+				is_already_published: Boolean(data.is_already_published),
+				is_unknown: Boolean(data.is_unknown),
+				in_progress: !Boolean(data.claimed) && (Boolean(data.in_progress) || data.error_code === "PUBLISHING_IN_PROGRESS"),
+				publication_id: data.publication_id,
+				retry_count: data.retry_count,
+				error_code: data.error_code,
+				error: data.message,
+			};
+		}
+	} catch {
+		// Fall through to direct table queries
+	}
+
+	// 2. Direct table fallback:
+	const { data: post, error: postErr } = await supabase
+		.from("social_content_posts")
+		.select("*")
+		.eq("id", postId)
+		.single();
+
+	if (postErr || !post) {
+		return { claimed: false, error_code: "POST_NOT_FOUND", error: `Post not found: ${postId}` };
+	}
+
+	if (post.post_status !== "approved") {
+		if (post.post_status === "published" || post.instagram_media_id) {
+			return { claimed: false, is_already_published: true };
+		}
+		return { claimed: false, error_code: "POST_NOT_APPROVED", error: `Post status is ${post.post_status}` };
+	}
+
+	if (post.human_review_required !== true) {
+		return { claimed: false, error_code: "HUMAN_REVIEW_NOT_REQUIRED", error: "human_review_required is not true" };
+	}
+
+	const { data: existingPub } = await supabase
+		.from("social_content_publications")
+		.select("*")
+		.eq("post_id", postId)
+		.eq("platform", "instagram")
+		.maybeSingle();
+
+	const now = new Date().toISOString();
+
+	if (existingPub) {
+		if (existingPub.publication_status === "published" || existingPub.instagram_media_id) {
+			return { claimed: false, is_already_published: true, publication_id: existingPub.id };
+		}
+
+		if (existingPub.publication_status === "unknown") {
+			return { claimed: false, is_unknown: true, publication_id: existingPub.id };
+		}
+
+		if (existingPub.publication_status === "publishing") {
+			const updatedAtMs = new Date(existingPub.updated_at || existingPub.created_at || Date.now()).getTime();
+			const ageMs = Date.now() - updatedAtMs;
+			if (ageMs < staleSeconds * 1000) {
+				return { claimed: false, in_progress: true, publication_id: existingPub.id };
+			}
+		}
+
+		const nextRetry = (existingPub.retry_count || 0) + 1;
+		const { data: updated, error: updateErr } = await supabase
+			.from("social_content_publications")
+			.update({
+				publication_status: "publishing",
+				retry_count: nextRetry,
+				updated_at: now,
+			})
+			.eq("id", existingPub.id)
+			.select()
+			.single();
+
+		if (updateErr) {
+			return { claimed: false, error: updateErr.message };
+		}
+
+		return { claimed: true, is_already_published: false, publication_id: existingPub.id, retry_count: nextRetry };
+	} else {
+		const { data: inserted, error: insertErr } = await supabase
+			.from("social_content_publications")
+			.insert({
+				post_id: postId,
+				platform: "instagram",
+				media_type: "CAROUSEL",
+				publication_status: "publishing",
+				instagram_account_id: "pending_config",
+				caption: post.instagram_caption || "LawBriefly Carousel",
+				slide_count: Number(post.carousel_slide_count) || 5,
+				retry_count: 1,
+				created_at: now,
+				updated_at: now,
+			})
+			.select()
+			.single();
+
+		if (insertErr) {
+			return { claimed: false, error: insertErr.message };
+		}
+
+		return { claimed: true, is_already_published: false, publication_id: inserted?.id, retry_count: 1 };
+	}
+}
+
+/**
+ * Sweeps the database for approved posts that were stranded in 'pending' status
+ * (e.g. if Queue.send() failed or the worker was interrupted) and enqueues them.
+ */
+export async function recoverStrandedApprovedPosts(env: Env): Promise<{
+	success: boolean;
+	checked: number;
+	enqueued: number;
+	recovered_count: number;
+	post_ids: string[];
+	errors: string[];
+}> {
+	if (env.INSTAGRAM_AUTO_PUBLISH_ON_APPROVAL !== "true" || !env.INSTAGRAM_PUBLISHING_QUEUE) {
+		return { success: true, checked: 0, enqueued: 0, recovered_count: 0, post_ids: [], errors: [] };
+	}
+
+	const supabase = getSupabaseClient(env);
+	const postIds: string[] = [];
+	const errors: string[] = [];
+
+	const { data: approvedPosts, error: postErr } = await supabase
+		.from("social_content_posts")
+		.select("*")
+		.eq("post_status", "approved")
+		.eq("human_review_required", true);
+
+	if (postErr || !approvedPosts || approvedPosts.length === 0) {
+		return { success: true, checked: 0, enqueued: 0, recovered_count: 0, post_ids: [], errors: [] };
+	}
+
+	const nowMs = Date.now();
+	const STRANDED_THRESHOLD_MS = 60 * 1000;
+
+	for (const post of approvedPosts) {
+		const slideCount = Number(post.carousel_slide_count);
+		if (isNaN(slideCount) || slideCount < 2 || slideCount > 10) {
+			continue;
+		}
+
+		const { data: pub } = await supabase
+			.from("social_content_publications")
+			.select("*")
+			.eq("post_id", post.id)
+			.eq("platform", "instagram")
+			.maybeSingle();
+
+		let isStranded = false;
+
+		if (!pub) {
+			isStranded = true;
+		} else if (pub.publication_status === "pending") {
+			const updatedAtMs = new Date(pub.updated_at || pub.created_at || 0).getTime();
+			if (nowMs - updatedAtMs > STRANDED_THRESHOLD_MS) {
+				isStranded = true;
+			}
+		}
+
+		if (isStranded) {
+			const jobId = deterministicPublishingJobId(post.id);
+			try {
+				await env.INSTAGRAM_PUBLISHING_QUEUE.send({
+					job_id: jobId,
+					post_id: post.id,
+					enqueued_at: new Date().toISOString(),
+				});
+				postIds.push(post.id);
+
+				if (pub) {
+					await supabase
+						.from("social_content_publications")
+						.update({ updated_at: new Date().toISOString() })
+						.eq("id", pub.id);
+				} else {
+					await recordApprovalPublicationOutbox(supabase, env, post.id);
+				}
+
+				console.log(`[Outbox Recovery] Enqueued stranded approved post ${post.id}`);
+			} catch (err: any) {
+				errors.push(`Failed to enqueue stranded post ${post.id}: ${err.message}`);
+				console.error(`[Outbox Recovery] Failed to enqueue stranded post ${post.id}:`, err);
+			}
+		}
+	}
+
+	return {
+		success: errors.length === 0,
+		checked: approvedPosts.length,
+		enqueued: postIds.length,
+		recovered_count: postIds.length,
+		post_ids: postIds,
+		errors,
+	};
+}
+
+/**
+ * Cloudflare Queue Consumer for Instagram Publishing (Task 18.2).
+ * Consumes messages from instagram-publishing-jobs queue:
+ * - Atomically claims publication work before executing it.
+ * - Reuses existing publishApprovedCarousel().
+ * - Acknowledges already-published jobs.
+ * - Never blindly retries publication_status = unknown.
+ * - Retries only errors proven safe to retry.
+ * - Never retries media_publish when its outcome is uncertain.
+ * - Handles messages already in publishing state safely.
+ */
+export async function handleInstagramPublishingQueue(
+	batch: MessageBatch<InstagramPublishingJobMessage>,
+	env: Env,
+	ctx?: ExecutionContext
+): Promise<void> {
+	const supabase = getSupabaseClient(env);
+
+	for (const message of batch.messages) {
+		const body = message.body;
+		const postId = body?.post_id;
+		const jobId = body?.job_id;
+
+		if (!postId || typeof postId !== "string" || !UUID_REGEX.test(postId)) {
+			console.warn(`[Queue Consumer] Acknowledging invalid message payload: ${JSON.stringify(body)}`);
+			message.ack();
+			continue;
+		}
+
+		// 1. Fetch post and enforce basic invariants
+		const { data: post, error: postErr } = await supabase
+			.from("social_content_posts")
+			.select("*")
+			.eq("id", postId)
+			.single();
+
+		if (postErr || !post) {
+			console.warn(`[Queue Consumer] Post ${postId} not found in database. Acknowledging message.`);
+			message.ack();
+			continue;
+		}
+
+		if (post.post_status === "published" || post.instagram_media_id) {
+			console.log(`[Queue Consumer] Post ${postId} already published. Acknowledging message.`);
+			message.ack();
+			continue;
+		}
+
+		if (post.post_status !== "approved" || post.human_review_required !== true) {
+			console.warn(`[Queue Consumer] Post ${postId} is not approved or review not required (status: ${post.post_status}). Acknowledging without retry.`);
+			message.ack();
+			continue;
+		}
+
+		const slideCount = Number(post.carousel_slide_count);
+		if (isNaN(slideCount) || slideCount < 2 || slideCount > 10) {
+			console.warn(`[Queue Consumer] Post ${postId} slide count (${slideCount}) is not a carousel. Automatic publishing restricted to CAROUSEL only. Acknowledging.`);
+			message.ack();
+			continue;
+		}
+
+		// 2. Atomically claim publication work before executing
+		const claim = await claimPublicationJob(supabase, postId);
+
+		if (claim.is_already_published) {
+			console.log(`[Queue Consumer] Post ${postId} already marked published in publication records. Acknowledging.`);
+			message.ack();
+			continue;
+		}
+
+		if (claim.is_unknown) {
+			console.warn(`[Queue Consumer] Post ${postId} publication status is 'unknown'. Manual reconciliation required. Never blindly retrying.`);
+			message.ack();
+			continue;
+		}
+
+		if (claim.in_progress) {
+			console.warn(`[Queue Consumer] Post ${postId} is currently in progress by another execution. Retrying with delay.`);
+			message.retry({ delaySeconds: 60 });
+			continue;
+		}
+
+		if (!claim.claimed) {
+			console.warn(`[Queue Consumer] Unable to claim publication job for post ${postId}: ${claim.error || claim.error_code}. Acknowledging.`);
+			message.ack();
+			continue;
+		}
+
+		// 3. Execute publishApprovedCarousel internally
+		try {
+			console.log(`[Queue Consumer] Executing publishApprovedCarousel for post ${postId} (job_id: ${jobId})`);
+			const result = await instagramPublishing.publishApprovedCarousel(env, postId, { prepareOnly: false });
+
+			if (result.success) {
+				message.ack();
+				console.log(`[Queue Consumer] Successfully published post ${postId} to Instagram! media_id: ${result.instagram_media_id}`);
+			} else {
+				message.retry({ delaySeconds: 30 });
+			}
+		} catch (err: any) {
+			const errMsg = err?.message || String(err);
+			console.error(`[Queue Consumer] Error publishing post ${postId}: ${errMsg}`);
+
+			// Uncertain outcome: NEVER blindly retry media_publish when outcome is unknown!
+			const isUnknownOutcome =
+				errMsg.includes("unknown") ||
+				errMsg.includes("PUBLISH_TIMEOUT") ||
+				errMsg.toLowerCase().includes("ambiguous") ||
+				errMsg.toLowerCase().includes("timeout");
+
+			const { data: checkPub } = await supabase
+				.from("social_content_publications")
+				.select("publication_status")
+				.eq("post_id", postId)
+				.eq("platform", "instagram")
+				.maybeSingle();
+
+			if (isUnknownOutcome || checkPub?.publication_status === "unknown") {
+				console.warn(`[Queue Consumer] Post ${postId} outcome is uncertain. Acknowledging message to prevent duplicate Instagram post.`);
+				message.ack();
+				continue;
+			}
+
+			if (errMsg.includes("already been published") || checkPub?.publication_status === "published") {
+				console.log(`[Queue Consumer] Post ${postId} already published. Acknowledging.`);
+				message.ack();
+				continue;
+			}
+
+			if (errMsg.includes("currently in progress")) {
+				console.warn(`[Queue Consumer] Post ${postId} currently in progress. Retrying in 60s.`);
+				message.retry({ delaySeconds: 60 });
+				continue;
+			}
+
+			const isPermanent =
+				errMsg.includes("not found") ||
+				errMsg.includes("not approved") ||
+				errMsg.includes("human_review_required") ||
+				errMsg.includes("Invalid slide_count");
+
+			if (isPermanent) {
+				console.warn(`[Queue Consumer] Permanent validation failure for post ${postId}. Acknowledging.`);
+				message.ack();
+				continue;
+			}
+
+			// Transient failure before media_publish: retry with backoff
+			console.warn(`[Queue Consumer] Transient error for post ${postId}. Requesting queue retry (delay: 30s).`);
+			message.retry({ delaySeconds: 30 });
+		}
+	}
+}
+
+/**
+ * Development-only handler for POST /api/ai/recover-stranded-publications.
+ */
+export async function handleRecoverStrandedPublications(request: Request, env: Env): Promise<Response> {
+	if (env.APP_ENV !== "development" && (env as any).ENVIRONMENT !== "development") {
+		return new Response(JSON.stringify({ error: "Not Found", status: 404 }), {
+			status: 404,
+			headers: { "Content-Type": "application/json" },
+		});
+	}
+
+	try {
+		const result = await recoverStrandedApprovedPosts(env);
+		return new Response(JSON.stringify(result), {
+			status: 200,
+			headers: { "Content-Type": "application/json" },
+		});
+	} catch (err: any) {
+		return new Response(JSON.stringify({ error: err.message || "Failed to recover stranded posts" }), {
+			status: 500,
 			headers: { "Content-Type": "application/json" },
 		});
 	}

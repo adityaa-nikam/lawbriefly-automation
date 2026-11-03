@@ -93,5 +93,27 @@ BEGIN
                 );
         END IF;
 
+        -- 2d. Replace UNIQUE(post_id, slide_number) with UNIQUE(post_id, asset_type, slide_number)
+        IF EXISTS (
+            SELECT 1 
+            FROM pg_constraint 
+            WHERE conname = 'social_content_assets_post_slide_number'
+              AND conrelid = 'public.social_content_assets'::regclass
+        ) THEN
+            ALTER TABLE public.social_content_assets 
+                DROP CONSTRAINT social_content_assets_post_slide_number;
+        END IF;
+
+        IF NOT EXISTS (
+            SELECT 1 
+            FROM pg_constraint 
+            WHERE conname = 'social_content_assets_post_type_slide_number'
+              AND conrelid = 'public.social_content_assets'::regclass
+        ) THEN
+            ALTER TABLE public.social_content_assets 
+                ADD CONSTRAINT social_content_assets_post_type_slide_number 
+                UNIQUE (post_id, asset_type, slide_number);
+        END IF;
+
     END IF;
 END $$;

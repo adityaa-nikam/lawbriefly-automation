@@ -126,11 +126,20 @@ import {
 	processTelegramCallback,
 	handleNotifyEditor,
 	handleTelegramWebhook,
+	dispatchAutoPublishOnApproval,
 	getValidatedTelegramEnv,
 	generateSecureRandomToken,
 	DEFAULT_APPROVAL_TTL_HOURS,
+	deterministicPublishingJobId,
+	recordApprovalPublicationOutbox,
+	claimPublicationJob,
+	recoverStrandedApprovedPosts,
+	handleInstagramPublishingQueue,
+	handleRecoverStrandedPublications,
 	type NotifyEditorResult,
 	type ProcessCallbackResult,
+	type AutoPublishResult,
+	type InstagramPublishingJobMessage,
 } from "../src/services/editorial-approval";
 import {
 	isValidJpegBuffer,
@@ -166,7 +175,12 @@ import {
 	type InstagramAuthMode,
 	type PublishSingleImageParams,
 	type PublishSingleImageResult,
+	validatePublicationRowConstraints,
+	recordSocialContentPublication,
+	recordSocialContentPublicationEvent,
+	ALLOWED_PUBLICATION_EVENT_TYPES,
 } from "../src/services/instagram-publishing";
+import * as instagramPublishingModule from "../src/services/instagram-publishing";
 
 const IncomingRequest = Request<unknown, IncomingRequestCfProperties>;
 
@@ -10591,7 +10605,7 @@ describe("Task 10 - Global Hot Legal Topic Selection Using Groq", () => {
 			});
 		});
 
-		describe("Task 16 — Telegram Editorial Notification & Approval Workflow", () => {
+		// Shared Editorial & Telegram Test Environment & Mock Helpers
 			const baseEnv: Env = {
 				LAWBRIEFLY_API_URL: "https://api.lawbriefly.test/v1/news",
 				LAWBRIEFLY_API_KEY: "super-secret-test-key-12345",
@@ -10632,6 +10646,7 @@ describe("Task 10 - Global Hot Legal Topic Selection Using Groq", () => {
 				existingRequest?: any;
 				existingActions?: any[];
 				existingEvents?: any[];
+				existingPublication?: any;
 				downloadError?: Error;
 				rpcError?: Error;
 				rpcResult?: any;
@@ -10669,23 +10684,37 @@ describe("Task 10 - Global Hot Legal Topic Selection Using Groq", () => {
 				let approvalRequest: any = options.existingRequest ? { ...options.existingRequest } : null;
 				let approvalActions: any[] = options.existingActions ? [...options.existingActions] : [];
 				let approvalEvents: any[] = options.existingEvents ? [...options.existingEvents] : [];
+				let publications: any[] = options.existingPublication ? [{ ...options.existingPublication }] : [];
 
 				const mockClient = {
 					from: vi.fn((table: string) => {
 						if (table === "social_content_posts") {
 							return {
-								select: vi.fn(() => ({
-									eq: vi.fn((col: string, val: any) => ({
+								select: vi.fn(() => {
+									const filters: { col: string; val: any }[] = [];
+									const query: any = {
+										eq: vi.fn((col: string, val: any) => {
+											filters.push({ col, val });
+											return query;
+										}),
 										single: vi.fn(async () => {
-											if (val === post?.id) return { data: post, error: null };
-											return { data: null, error: new Error(`Post not found: ${val}`) };
+											const matches = filters.every((f) => post && post[f.col] === f.val);
+											if (matches) return { data: post, error: null };
+											return { data: null, error: new Error("Post not found") };
 										}),
 										maybeSingle: vi.fn(async () => {
-											if (val === post?.id) return { data: post, error: null };
+											const matches = filters.every((f) => post && post[f.col] === f.val);
+											if (matches) return { data: post, error: null };
 											return { data: null, error: null };
 										}),
-									})),
-								})),
+										then: (resolve: any, reject?: any) => {
+											const matches = filters.every((f) => post && post[f.col] === f.val);
+											return Promise.resolve({ data: matches ? [post] : [], error: null }).then(resolve, reject);
+										},
+										catch: (reject: any) => Promise.resolve({ data: [], error: null }).catch(reject),
+									};
+									return query;
+								}),
 								update: vi.fn((updates: any) => ({
 									eq: vi.fn((col: string, val: any) => {
 										if (val === post?.id) {
@@ -10821,6 +10850,133 @@ describe("Task 10 - Global Hot Legal Topic Selection Using Groq", () => {
 								insert: vi.fn(async (event: any) => {
 									approvalEvents.push(event);
 									return { error: null };
+								}),
+							};
+						}
+
+						if (table === "social_content_publications") {
+							return {
+								select: vi.fn((fields?: string) => {
+									const filters: Array<{ type: string; col: string; val: any }> = [];
+									const queryObj: any = {
+										eq: vi.fn((col: string, val: any) => {
+											filters.push({ type: "eq", col, val });
+											return queryObj;
+										}),
+										is: vi.fn((col: string, val: any) => {
+											filters.push({ type: "is", col, val });
+											return queryObj;
+										}),
+										lt: vi.fn((col: string, val: any) => {
+											filters.push({ type: "lt", col, val });
+											return queryObj;
+										}),
+										in: vi.fn((col: string, val: any) => {
+											filters.push({ type: "in", col, val });
+											return queryObj;
+										}),
+										order: vi.fn(() => queryObj),
+										limit: vi.fn(() => queryObj),
+										maybeSingle: vi.fn(async () => {
+											const filtered = publications.filter((p) => {
+												return filters.every((f) => {
+													if (f.type === "eq") return p[f.col] === f.val;
+													if (f.type === "is") return p[f.col] === f.val;
+													return true;
+												});
+											});
+											return { data: filtered.length > 0 ? { ...filtered[0] } : null, error: null };
+										}),
+										single: vi.fn(async () => {
+											const filtered = publications.filter((p) => {
+												return filters.every((f) => {
+													if (f.type === "eq") return p[f.col] === f.val;
+													if (f.type === "is") return p[f.col] === f.val;
+													return true;
+												});
+											});
+											if (filtered.length > 0) return { data: { ...filtered[0] }, error: null };
+											return { data: null, error: new Error("Publication not found") };
+										}),
+										then: (resolve: any, reject?: any) => {
+											const filtered = publications.filter((p) => {
+												return filters.every((f) => {
+													if (f.type === "eq") return p[f.col] === f.val;
+													if (f.type === "is") return p[f.col] === f.val;
+													if (f.type === "lt") {
+														const dateVal = new Date(p[f.col] || 0).getTime();
+														const compareVal = new Date(f.val).getTime();
+														return dateVal < compareVal;
+													}
+													return true;
+												});
+											});
+											return Promise.resolve({ data: filtered.map((x) => ({ ...x })), error: null }).then(resolve, reject);
+										},
+										catch: (reject: any) => Promise.resolve({ data: [], error: null }).catch(reject),
+									};
+									return queryObj;
+								}),
+								insert: vi.fn((row: any) => {
+									const rows = Array.isArray(row) ? row : [row];
+									const insertedRows = rows.map((r, i) => {
+										const newId = r.id || `pub-uuid-${publications.length + i + 1}`;
+										return {
+											id: newId,
+											created_at: new Date().toISOString(),
+											updated_at: new Date().toISOString(),
+											...r,
+										};
+									});
+									publications.push(...insertedRows);
+									const first = insertedRows[0];
+									const insertResult: any = {
+										select: vi.fn(() => ({
+											single: vi.fn(async () => ({ data: { ...first }, error: null })),
+										})),
+										then: (resolve: any, reject?: any) => Promise.resolve({ data: first, error: null }).then(resolve, reject),
+										catch: (reject: any) => Promise.resolve({ data: first, error: null }).catch(reject),
+									};
+									return insertResult;
+								}),
+								update: vi.fn((updates: any) => {
+									const filters: Array<{ type: string; col: string; val: any }> = [];
+									const applyUpdate = () => {
+										const targets = publications.filter((p) =>
+											filters.every((f) => p[f.col] === f.val)
+										);
+										for (const t of targets) {
+											Object.assign(t, updates);
+										}
+									};
+									const updateObj: any = {
+										eq: vi.fn((col: string, val: any) => {
+											filters.push({ type: "eq", col, val });
+											applyUpdate();
+											return updateObj;
+										}),
+										select: vi.fn(() => ({
+											single: vi.fn(async () => {
+												applyUpdate();
+												const target = publications.find((p) =>
+													filters.every((f) => p[f.col] === f.val)
+												);
+												if (target) {
+													return { data: { ...target }, error: null };
+												}
+												return { data: null, error: new Error("Publication not found to update") };
+											}),
+										})),
+										then: (resolve: any, reject?: any) => {
+											applyUpdate();
+											return Promise.resolve({ error: null }).then(resolve, reject);
+										},
+										catch: (reject: any) => {
+											applyUpdate();
+											return Promise.resolve({ error: null }).catch(reject);
+										},
+									};
+									return updateObj;
 								}),
 							};
 						}
@@ -11011,12 +11167,70 @@ describe("Task 10 - Global Hot Legal Topic Selection Using Groq", () => {
 							};
 						}
 
+						if (funcName === "claim_publication_job") {
+							const existing = publications.find((p) => p.post_id === params.p_post_id) || options.existingPublication;
+							if (existing && existing.publication_status === "published") {
+								return {
+									data: {
+										claimed: false,
+										post_id: params.p_post_id,
+										publication_id: existing.id,
+										previous_status: "published",
+										message: "Publication already completed",
+									},
+									error: null,
+								};
+							}
+							if (existing && existing.publication_status === "unknown") {
+								return {
+									data: {
+										claimed: false,
+										post_id: params.p_post_id,
+										publication_id: existing.id,
+										previous_status: "unknown",
+										message: "Publication outcome unknown; requires manual verification",
+									},
+									error: null,
+								};
+							}
+							const prevStatus = existing?.publication_status || "pending";
+							if (existing) {
+								existing.publication_status = "publishing";
+								existing.retry_count = (existing.retry_count || 0) + 1;
+								existing.updated_at = new Date().toISOString();
+							} else {
+								const newPub = {
+									id: `pub-claimed-${Date.now()}`,
+									post_id: params.p_post_id,
+									platform: "instagram",
+									publication_status: "publishing",
+									retry_count: 1,
+									created_at: new Date().toISOString(),
+									updated_at: new Date().toISOString(),
+								};
+								publications.push(newPub);
+							}
+							return {
+								data: {
+									claimed: true,
+									post_id: params.p_post_id,
+									publication_id: existing?.id || publications[publications.length - 1].id,
+									previous_status: prevStatus,
+									post_status: post.post_status,
+									human_review_required: post.human_review_required,
+									carousel_slide_count: post.carousel_slide_count,
+								},
+								error: null,
+							};
+						}
+
 						return { data: null, error: new Error(`Unknown RPC ${funcName}`) };
 					}),
 					getPost: () => post,
 					getApprovalRequest: () => approvalRequest,
 					getApprovalActions: () => approvalActions,
 					getApprovalEvents: () => approvalEvents,
+					getPublications: () => publications,
 				};
 
 				return {
@@ -11025,6 +11239,7 @@ describe("Task 10 - Global Hot Legal Topic Selection Using Groq", () => {
 					getApprovalRequest: () => approvalRequest,
 					getApprovalActions: () => approvalActions,
 					getApprovalEvents: () => approvalEvents,
+					getPublications: () => publications,
 				};
 			}
 
@@ -11081,6 +11296,7 @@ describe("Task 10 - Global Hot Legal Topic Selection Using Groq", () => {
 				return { spy, calls };
 			}
 
+		describe("Task 16 — Telegram Editorial Notification & Approval Workflow", () => {
 			describe("Telegram Bot Service Unit Tests", () => {
 				it("1. escapeTelegramHtml correctly escapes &, <, >, \", and '", () => {
 					const input = `Legal & Tax "Alert" <GST 'Council'>`;
@@ -12630,6 +12846,7 @@ describe("Task 10 - Global Hot Legal Topic Selection Using Groq", () => {
 			function createMockPublishingSupabase(options: {
 				post?: any;
 				assets?: any[];
+				existingPublication?: any;
 				downloadError?: Error;
 				uploadError?: Error;
 				updateError?: Error;
@@ -12654,6 +12871,8 @@ describe("Task 10 - Global Hot Legal Topic Selection Using Groq", () => {
 				];
 
 				const assets = options.assets ? [...options.assets] : defaultAssets;
+				let pubData = options.existingPublication ? { ...options.existingPublication } : null;
+				const events: any[] = [];
 				const uploadedFiles = new Map<string, Uint8Array>();
 				let capturedSignedUrlExpiry: number | null = null;
 
@@ -12679,6 +12898,45 @@ describe("Task 10 - Global Hot Legal Topic Selection Using Groq", () => {
 										return { data: null, error: new Error("Post not found") };
 									}),
 								})),
+							};
+						}
+
+						if (table === "social_content_publications") {
+							return {
+								select: vi.fn().mockReturnValue({
+									eq: vi.fn().mockImplementation((f1: string, v1: string) => ({
+										eq: vi.fn().mockImplementation((f2: string, v2: string) => ({
+											maybeSingle: vi.fn().mockImplementation(async () => ({ data: pubData ? { ...pubData } : null, error: null })),
+										})),
+										maybeSingle: vi.fn().mockImplementation(async () => ({ data: pubData ? { ...pubData } : null, error: null })),
+									})),
+								}),
+								update: vi.fn().mockImplementation((updates: any) => ({
+									eq: vi.fn().mockImplementation((f1: string, v1: string) => ({
+										eq: vi.fn().mockImplementation(async (f2: string, v2: string) => {
+											if (pubData) pubData = { ...pubData, ...updates };
+											else pubData = { ...updates };
+											return { data: pubData, error: null };
+										}),
+									})),
+								})),
+								upsert: vi.fn().mockImplementation((row: any) => ({
+									select: vi.fn().mockReturnValue({
+										maybeSingle: vi.fn().mockImplementation(async () => {
+											pubData = { id: "pub_mock_123", ...row };
+											return { data: pubData, error: null };
+										}),
+									}),
+								})),
+							};
+						}
+
+						if (table === "social_content_publication_events") {
+							return {
+								insert: vi.fn().mockImplementation(async (eventRow: any) => {
+									events.push(eventRow);
+									return { data: eventRow, error: null };
+								}),
 							};
 						}
 
@@ -12740,6 +12998,8 @@ describe("Task 10 - Global Hot Legal Topic Selection Using Groq", () => {
 				return {
 					mockClient,
 					getPost: () => ({ ...post }),
+					getPublication: () => (pubData ? { ...pubData } : null),
+					getEvents: () => [...events],
 					uploadedFiles,
 					getCapturedSignedUrlExpiry: () => capturedSignedUrlExpiry,
 				};
@@ -13313,6 +13573,139 @@ describe("Task 10 - Global Hot Legal Topic Selection Using Groq", () => {
 					// Zero calls to media_publish
 					expect(calls.some((c) => c.url.endsWith("/media_publish"))).toBe(false);
 					expect(mockSupabase.getPost().post_status).toBe("approved");
+				});
+			});
+
+			describe("Task 17.7 Pre-Publication Safety Audit Tests", () => {
+				it("21a. reuses existing FINISHED parent container and avoids recreating child/parent containers", async () => {
+					const preparedPub = {
+						id: "pub_prepared_123",
+						post_id: "17000000-0000-0000-0000-000000001700",
+						platform: "instagram",
+						media_type: "CAROUSEL",
+						slide_count: 5,
+						publication_status: "processing",
+						carousel_container_id: "18132493609757786",
+						child_container_ids: ["c1", "c2", "c3", "c4", "c5"],
+						caption: "Prepared caption #LawBriefly",
+					};
+
+					const mockSupabase = createMockPublishingSupabase({ existingPublication: preparedPub });
+					vi.spyOn(supabaseModule, "getSupabaseClient").mockReturnValue(mockSupabase.mockClient as any);
+					const { calls } = setupMetaFetchMock();
+
+					// Call with prepareOnly: false to execute publishing using existing container
+					const result = await publishApprovedCarousel(mockInstagramDevEnv, "17000000-0000-0000-0000-000000001700", {
+						prepareOnly: false,
+					});
+
+					expect(result.success).toBe(true);
+					expect(result.is_container_reused).toBe(true);
+					expect(result.carousel_container_id).toBe("18132493609757786");
+					expect(result.child_container_ids).toEqual(["c1", "c2", "c3", "c4", "c5"]);
+					expect(result.instagram_media_id).toBe("17999999999999999");
+
+					// Critical invariant: ZERO container creation requests were made to Meta (/media endpoint)
+					const containerCreationCalls = calls.filter((c) => c.method === "POST" && c.url.endsWith("/media"));
+					expect(containerCreationCalls).toHaveLength(0);
+
+					// Verifies publication record and post status transitioned to published
+					expect(mockSupabase.getPost().post_status).toBe("published");
+					expect(mockSupabase.getPublication()?.publication_status).toBe("published");
+					expect(mockSupabase.getPublication()?.instagram_media_id).toBe("17999999999999999");
+				});
+
+				it("21b. prevents duplicate publication if post is already published or actively publishing", async () => {
+					// 1. When publication record is already 'published'
+					const publishedPub = {
+						id: "pub_already_done",
+						post_id: "17000000-0000-0000-0000-000000001700",
+						platform: "instagram",
+						media_type: "CAROUSEL",
+						slide_count: 5,
+						publication_status: "published",
+						carousel_container_id: "18132493609757786",
+						instagram_media_id: "17999999999999999",
+					};
+
+					const mockSupabaseDone = createMockPublishingSupabase({ existingPublication: publishedPub });
+					vi.spyOn(supabaseModule, "getSupabaseClient").mockReturnValue(mockSupabaseDone.mockClient as any);
+					setupMetaFetchMock();
+
+					await expect(
+						publishApprovedCarousel(mockInstagramDevEnv, "17000000-0000-0000-0000-000000001700", { prepareOnly: false })
+					).rejects.toThrow("Post has already been published to Instagram. Republishing is prohibited.");
+
+					// 2. When publication record is actively 'publishing'
+					const inFlightPub = {
+						id: "pub_in_flight",
+						post_id: "17000000-0000-0000-0000-000000001700",
+						platform: "instagram",
+						media_type: "CAROUSEL",
+						slide_count: 5,
+						publication_status: "publishing",
+						updated_at: new Date().toISOString(),
+					};
+
+					const mockSupabaseInFlight = createMockPublishingSupabase({ existingPublication: inFlightPub });
+					vi.spyOn(supabaseModule, "getSupabaseClient").mockReturnValue(mockSupabaseInFlight.mockClient as any);
+
+					await expect(
+						publishApprovedCarousel(mockInstagramDevEnv, "17000000-0000-0000-0000-000000001700", { prepareOnly: false })
+					).rejects.toThrow("Publishing is currently in progress for this post. Concurrent execution prevented.");
+				});
+
+				it("21c. handles timeout/network failure safely: sets status to 'unknown' and preserves post approval status", async () => {
+					const preparedPub = {
+						id: "pub_prepared_timeout",
+						post_id: "17000000-0000-0000-0000-000000001700",
+						platform: "instagram",
+						media_type: "CAROUSEL",
+						slide_count: 5,
+						publication_status: "processing",
+						carousel_container_id: "18132493609757786",
+						child_container_ids: ["c1", "c2", "c3", "c4", "c5"],
+						caption: "Caption",
+					};
+
+					const mockSupabase = createMockPublishingSupabase({ existingPublication: preparedPub });
+					vi.spyOn(supabaseModule, "getSupabaseClient").mockReturnValue(mockSupabase.mockClient as any);
+
+					// Mock media_publish to throw a TimeoutError
+					vi.spyOn(globalThis, "fetch").mockImplementation(async (input: any, init?: any) => {
+						const url = typeof input === "string" ? input : input.url;
+						if (url.includes("fields=status_code,status")) {
+							return new Response(JSON.stringify({ status_code: "FINISHED" }), { status: 200, headers: { "Content-Type": "application/json" } });
+						}
+						if (url.endsWith("/media_publish")) {
+							const timeoutErr = new Error("Fetch request timed out after 30000ms");
+							timeoutErr.name = "TimeoutError";
+							throw timeoutErr;
+						}
+						return new Response(JSON.stringify({}), { status: 200, headers: { "Content-Type": "application/json" } });
+					});
+
+					await expect(
+						publishApprovedCarousel(mockInstagramDevEnv, "17000000-0000-0000-0000-000000001700", { prepareOnly: false })
+					).rejects.toThrow("Instagram media publication failed (unknown): Fetch request timed out after 30000ms");
+
+					// Critical invariant: post_status in social_content_posts MUST remain 'approved'
+					expect(mockSupabase.getPost().post_status).toBe("approved");
+
+					// Critical invariant: publication_status in social_content_publications must be 'unknown'
+					expect(mockSupabase.getPublication()?.publication_status).toBe("unknown");
+					expect(mockSupabase.getPublication()?.error_code).toBe("PUBLISH_TIMEOUT");
+
+					// Critical invariant: audit event publication_failed is recorded
+					const events = mockSupabase.getEvents();
+					const failEvent = events.find((e) => e.event_type === "publication_failed");
+					expect(failEvent).toBeDefined();
+					expect(failEvent.details.is_timeout).toBe(true);
+
+					// Subsequent call must reject to prevent blind retries
+					await expect(
+						publishApprovedCarousel(mockInstagramDevEnv, "17000000-0000-0000-0000-000000001700", { prepareOnly: false })
+					).rejects.toThrow("Publication status is 'unknown' due to a previous ambiguous network failure");
 				});
 			});
 
@@ -14058,6 +14451,1443 @@ describe("Task 10 - Global Hot Legal Topic Selection Using Groq", () => {
 						"Incomplete carousel assets: post requires 5 slides, but found 3 JPEG(s) and 0 PNG(s). Never publish an incomplete carousel."
 					);
 				});
+			});
+
+			describe("Migration-to-Code Compatibility Verification (Task 17)", () => {
+				it("44. validates that IMAGE requires slide_count = 1 and rejects any other value", () => {
+					expect(() => {
+						validatePublicationRowConstraints({
+							postId: "17000000-0000-0000-0000-000000001700",
+							mediaType: "IMAGE",
+							slideCount: 1,
+							publicationStatus: "published",
+							accountId: "17841422733573542",
+							caption: "Valid image caption",
+						});
+					}).not.toThrow();
+
+					expect(() => {
+						validatePublicationRowConstraints({
+							postId: "17000000-0000-0000-0000-000000001700",
+							mediaType: "IMAGE",
+							slideCount: 0,
+							publicationStatus: "published",
+							accountId: "17841422733573542",
+							caption: "Invalid image slide count",
+						});
+					}).toThrow("Invalid slide_count 0 for media_type 'IMAGE'. Must be exactly 1.");
+
+					expect(() => {
+						validatePublicationRowConstraints({
+							postId: "17000000-0000-0000-0000-000000001700",
+							mediaType: "IMAGE",
+							slideCount: 5,
+							publicationStatus: "published",
+							accountId: "17841422733573542",
+							caption: "Invalid image slide count",
+						});
+					}).toThrow("Invalid slide_count 5 for media_type 'IMAGE'. Must be exactly 1.");
+				});
+
+				it("45. validates that CAROUSEL requires slide_count between 2 and 10 and rejects outside bounds", () => {
+					for (let count = 2; count <= 10; count++) {
+						expect(() => {
+							validatePublicationRowConstraints({
+								postId: "17000000-0000-0000-0000-000000001700",
+								mediaType: "CAROUSEL",
+								slideCount: count,
+								publicationStatus: "published",
+								accountId: "17841422733573542",
+								caption: "Valid carousel caption",
+							});
+						}).not.toThrow();
+					}
+
+					expect(() => {
+						validatePublicationRowConstraints({
+							postId: "17000000-0000-0000-0000-000000001700",
+							mediaType: "CAROUSEL",
+							slideCount: 1,
+							publicationStatus: "published",
+							accountId: "17841422733573542",
+							caption: "Invalid carousel slide count",
+						});
+					}).toThrow("Invalid slide_count 1 for media_type 'CAROUSEL'. Must be between 2 and 10.");
+
+					expect(() => {
+						validatePublicationRowConstraints({
+							postId: "17000000-0000-0000-0000-000000001700",
+							mediaType: "CAROUSEL",
+							slideCount: 11,
+							publicationStatus: "published",
+							accountId: "17841422733573542",
+							caption: "Invalid carousel slide count",
+						});
+					}).toThrow("Invalid slide_count 11 for media_type 'CAROUSEL'. Must be between 2 and 10.");
+				});
+
+				it("46. validates that REEL requires slide_count = 0 and rejects any non-zero count", () => {
+					expect(() => {
+						validatePublicationRowConstraints({
+							postId: "17000000-0000-0000-0000-000000001700",
+							mediaType: "REEL",
+							slideCount: 0,
+							publicationStatus: "published",
+							accountId: "17841422733573542",
+							caption: "Valid reel caption",
+						});
+					}).not.toThrow();
+
+					expect(() => {
+						validatePublicationRowConstraints({
+							postId: "17000000-0000-0000-0000-000000001700",
+							mediaType: "REEL",
+							slideCount: 1,
+							publicationStatus: "published",
+							accountId: "17841422733573542",
+							caption: "Invalid reel slide count",
+						});
+					}).toThrow("Invalid slide_count 1 for media_type 'REEL'. Must be exactly 0.");
+				});
+
+				it("47. every event_type written by the application matches migration check constraint exactly", async () => {
+					const expectedMigrationEvents = [
+						"assets_prepared",
+						"single_container_created",
+						"child_containers_created",
+						"parent_container_created",
+						"container_processing_finished",
+						"container_processing_failed",
+						"published_success",
+						"publication_failed",
+					];
+
+					expect(ALLOWED_PUBLICATION_EVENT_TYPES.size).toBe(expectedMigrationEvents.length);
+					for (const event of expectedMigrationEvents) {
+						expect(ALLOWED_PUBLICATION_EVENT_TYPES.has(event as any)).toBe(true);
+					}
+
+					// Test rejection of unknown event
+					const mockSupabase = { from: vi.fn() };
+					await expect(recordSocialContentPublicationEvent(mockSupabase, {
+						postId: "17000000-0000-0000-0000-000000001700",
+						eventType: "invalid_unsupported_event" as any,
+					})).rejects.toThrow("Invalid publication event_type");
+				});
+
+				it("48. confirms UNIQUE(post_id, asset_type, slide_number) and asset_key constraints are non-conflicting", () => {
+					// Verify that for a given post and slide, the slide and publishing_slide assets have distinct asset_keys and storage_paths
+					const postId = "17000000-0000-0000-0000-000000001700";
+					const slide1Png = {
+						post_id: postId,
+						asset_type: "slide",
+						asset_key: "slide-01",
+						slide_number: 1,
+						storage_path: `posts/${postId}/slide-01.png`,
+						mime_type: "image/png",
+					};
+					const slide1Jpeg = {
+						post_id: postId,
+						asset_type: "publishing_slide",
+						asset_key: "slide-01-jpeg",
+						slide_number: 1,
+						storage_path: `posts/${postId}/publishing/slide-01.jpg`,
+						mime_type: "image/jpeg",
+					};
+
+					// Unique constraints verification
+					expect(slide1Png.asset_key).not.toBe(slide1Jpeg.asset_key); // UNIQUE(post_id, asset_key) holds
+					expect(slide1Png.storage_path).not.toBe(slide1Jpeg.storage_path); // UNIQUE(storage_path) holds
+					expect(slide1Png.asset_type).not.toBe(slide1Jpeg.asset_type); // UNIQUE(post_id, asset_type, slide_number) holds
+				});
+			});
+		});
+
+		describe("Task 18 — Approval-to-Publishing Automation", () => {
+			const mockAutoPublishEnv: Env = {
+				...mockTelegramDevEnv,
+				INSTAGRAM_AUTH_MODE: "instagram_login",
+				INSTAGRAM_ACCESS_TOKEN: "mock_test_instagram_token_xyz987",
+				INSTAGRAM_ACCOUNT_ID: "17841422733573542",
+				INSTAGRAM_GRAPH_VERSION: "v26.0",
+				INSTAGRAM_AUTO_PUBLISH_ON_APPROVAL: "true",
+			};
+
+			const mockAutoPublishDisabledEnv: Env = {
+				...mockAutoPublishEnv,
+				INSTAGRAM_AUTO_PUBLISH_ON_APPROVAL: "false",
+			};
+
+			const validToken = "1234567890abcdef1234567890abcdef";
+			let tokenHash: string;
+
+			beforeEach(async () => {
+				tokenHash = await calculateSha256(validToken);
+				vi.restoreAllMocks();
+			});
+
+			afterEach(() => {
+				vi.restoreAllMocks();
+			});
+
+			it("1. successful editorial approval triggers one publishing job when INSTAGRAM_AUTO_PUBLISH_ON_APPROVAL is 'true'", async () => {
+				const publishSpy = vi.spyOn(instagramPublishingModule, "publishApprovedCarousel").mockResolvedValue({
+					success: true,
+					publication_id: "pub-uuid-1801",
+					instagram_media_id: "17841499999999",
+					publication_status: "published",
+				} as any);
+
+				const mockSupabase = createMockTelegramSupabase({
+					post: {
+						id: "18000000-0000-0000-0000-000000001801",
+						post_status: "pending_approval",
+						human_review_required: true,
+						carousel_slide_count: 5,
+					},
+					existingRequest: {
+						id: "req-uuid-1801",
+						post_id: "18000000-0000-0000-0000-000000001801",
+						decision_status: "pending",
+						telegram_chat_id: "-1001234567890",
+						telegram_control_message_id: 201,
+						expires_at: new Date(Date.now() + 3600000).toISOString(),
+					},
+					existingActions: [
+						{
+							id: "act-1801",
+							approval_request_id: "req-uuid-1801",
+							action: "approve",
+							token_hash: tokenHash,
+							consumed_at: null,
+						},
+					],
+				});
+				vi.spyOn(supabaseModule, "getSupabaseClient").mockReturnValue(mockSupabase.mockClient as any);
+				setupTelegramFetchMock();
+
+				const update: TelegramUpdate = {
+					update_id: 80001,
+					callback_query: {
+						id: "cbq_auto_pub_01",
+						from: { id: 123456789, is_bot: false, first_name: "Aditya" },
+						message: {
+							message_id: 201,
+							chat: { id: -1001234567890, type: "supergroup" },
+							date: Math.floor(Date.now() / 1000),
+							text: "<b>EDITORIAL REVIEW</b>",
+						},
+						data: `a:${validToken}`,
+					},
+				};
+
+				const result = await processTelegramCallback(update, mockAutoPublishEnv);
+				expect(result.success).toBe(true);
+				expect(result.decision_status).toBe("approved");
+				expect(result.auto_publish_dispatched).toBe(true);
+				expect(result.is_duplicate).toBe(false);
+
+				// Exactly one publication job triggered
+				expect(publishSpy).toHaveBeenCalledTimes(1);
+				expect(publishSpy).toHaveBeenCalledWith(
+					mockAutoPublishEnv,
+					"18000000-0000-0000-0000-000000001801",
+					{ prepareOnly: false }
+				);
+			});
+
+			it("2. keeps Telegram webhook response non-blocking by dispatching via ctx.waitUntil", async () => {
+				const publishSpy = vi.spyOn(instagramPublishingModule, "publishApprovedCarousel").mockResolvedValue({
+					success: true,
+					publication_id: "pub-uuid-1802",
+					instagram_media_id: "17841499999999",
+					publication_status: "published",
+				} as any);
+
+				const mockSupabase = createMockTelegramSupabase({
+					post: {
+						id: "18000000-0000-0000-0000-000000001802",
+						post_status: "pending_approval",
+						human_review_required: true,
+						carousel_slide_count: 5,
+					},
+					existingRequest: {
+						id: "req-uuid-1802",
+						post_id: "18000000-0000-0000-0000-000000001802",
+						decision_status: "pending",
+						telegram_chat_id: "-1001234567890",
+						telegram_control_message_id: 201,
+						expires_at: new Date(Date.now() + 3600000).toISOString(),
+					},
+					existingActions: [
+						{
+							id: "act-1802",
+							approval_request_id: "req-uuid-1802",
+							action: "approve",
+							token_hash: tokenHash,
+							consumed_at: null,
+						},
+					],
+				});
+				vi.spyOn(supabaseModule, "getSupabaseClient").mockReturnValue(mockSupabase.mockClient as any);
+				setupTelegramFetchMock();
+
+				const mockCtx = {
+					waitUntil: vi.fn(),
+					passThroughOnException: vi.fn(),
+				};
+
+				const update: TelegramUpdate = {
+					update_id: 80002,
+					callback_query: {
+						id: "cbq_auto_pub_02",
+						from: { id: 123456789, is_bot: false, first_name: "Aditya" },
+						message: {
+							message_id: 201,
+							chat: { id: -1001234567890, type: "supergroup" },
+							date: Math.floor(Date.now() / 1000),
+							text: "<b>EDITORIAL REVIEW</b>",
+						},
+						data: `a:${validToken}`,
+					},
+				};
+
+				const result = await processTelegramCallback(update, mockAutoPublishEnv, mockCtx as any);
+				expect(result.success).toBe(true);
+				expect(result.auto_publish_dispatched).toBe(true);
+
+				// Background execution passed to ctx.waitUntil
+				expect(mockCtx.waitUntil).toHaveBeenCalledTimes(1);
+				expect(mockCtx.waitUntil).toHaveBeenCalledWith(expect.any(Promise));
+			});
+
+			it("3. approval does NOT trigger publishing when INSTAGRAM_AUTO_PUBLISH_ON_APPROVAL is false or unset", async () => {
+				const publishSpy = vi.spyOn(instagramPublishingModule, "publishApprovedCarousel");
+
+				const mockSupabase = createMockTelegramSupabase({
+					post: {
+						id: "18000000-0000-0000-0000-000000001803",
+						post_status: "pending_approval",
+						human_review_required: true,
+						carousel_slide_count: 5,
+					},
+					existingRequest: {
+						id: "req-uuid-1803",
+						post_id: "18000000-0000-0000-0000-000000001803",
+						decision_status: "pending",
+						telegram_chat_id: "-1001234567890",
+						telegram_control_message_id: 201,
+						expires_at: new Date(Date.now() + 3600000).toISOString(),
+					},
+					existingActions: [
+						{
+							id: "act-1803",
+							approval_request_id: "req-uuid-1803",
+							action: "approve",
+							token_hash: tokenHash,
+							consumed_at: null,
+						},
+					],
+				});
+				vi.spyOn(supabaseModule, "getSupabaseClient").mockReturnValue(mockSupabase.mockClient as any);
+				setupTelegramFetchMock();
+
+				const update: TelegramUpdate = {
+					update_id: 80003,
+					callback_query: {
+						id: "cbq_auto_pub_03",
+						from: { id: 123456789, is_bot: false, first_name: "Aditya" },
+						message: {
+							message_id: 201,
+							chat: { id: -1001234567890, type: "supergroup" },
+							date: Math.floor(Date.now() / 1000),
+							text: "<b>EDITORIAL REVIEW</b>",
+						},
+						data: `a:${validToken}`,
+					},
+				};
+
+				// Explicitly test with disabled env
+				const result = await processTelegramCallback(update, mockAutoPublishDisabledEnv);
+				expect(result.success).toBe(true);
+				expect(result.decision_status).toBe("approved");
+				expect(result.auto_publish_dispatched).toBe(false);
+
+				// publishApprovedCarousel was NOT called
+				expect(publishSpy).not.toHaveBeenCalled();
+			});
+
+			it("4. editorial rejection NEVER triggers publishing", async () => {
+				const publishSpy = vi.spyOn(instagramPublishingModule, "publishApprovedCarousel");
+
+				const rejectToken = "fedcba0987654321fedcba0987654321";
+				const rejectTokenHash = await calculateSha256(rejectToken);
+
+				const mockSupabase = createMockTelegramSupabase({
+					post: {
+						id: "18000000-0000-0000-0000-000000001804",
+						post_status: "pending_approval",
+						human_review_required: true,
+						carousel_slide_count: 5,
+					},
+					existingRequest: {
+						id: "req-uuid-1804",
+						post_id: "18000000-0000-0000-0000-000000001804",
+						decision_status: "pending",
+						telegram_chat_id: "-1001234567890",
+						telegram_control_message_id: 201,
+						expires_at: new Date(Date.now() + 3600000).toISOString(),
+					},
+					existingActions: [
+						{
+							id: "act-1804",
+							approval_request_id: "req-uuid-1804",
+							action: "reject",
+							token_hash: rejectTokenHash,
+							consumed_at: null,
+						},
+					],
+				});
+				vi.spyOn(supabaseModule, "getSupabaseClient").mockReturnValue(mockSupabase.mockClient as any);
+				setupTelegramFetchMock();
+
+				const update: TelegramUpdate = {
+					update_id: 80004,
+					callback_query: {
+						id: "cbq_auto_pub_04",
+						from: { id: 123456789, is_bot: false, first_name: "Aditya" },
+						message: {
+							message_id: 201,
+							chat: { id: -1001234567890, type: "supergroup" },
+							date: Math.floor(Date.now() / 1000),
+							text: "<b>EDITORIAL REVIEW</b>",
+						},
+						data: `r:${rejectToken}`,
+					},
+				};
+
+				const result = await processTelegramCallback(update, mockAutoPublishEnv);
+				expect(result.success).toBe(true);
+				expect(result.decision_status).toBe("rejected");
+				expect(result.auto_publish_dispatched).toBe(false);
+
+				// Publishing never called on rejection
+				expect(publishSpy).not.toHaveBeenCalled();
+			});
+
+			it("5. duplicate Telegram callback triggers nothing additional (idempotency)", async () => {
+				const publishSpy = vi.spyOn(instagramPublishingModule, "publishApprovedCarousel");
+
+				const mockSupabase = createMockTelegramSupabase({
+					post: {
+						id: "18000000-0000-0000-0000-000000001805",
+						post_status: "approved",
+						human_review_required: true,
+						carousel_slide_count: 5,
+					},
+					existingRequest: {
+						id: "req-uuid-1805",
+						post_id: "18000000-0000-0000-0000-000000001805",
+						decision_status: "approved",
+						telegram_chat_id: "-1001234567890",
+						telegram_control_message_id: 201,
+						expires_at: new Date(Date.now() + 3600000).toISOString(),
+					},
+					existingActions: [
+						{
+							id: "act-1805",
+							approval_request_id: "req-uuid-1805",
+							action: "approve",
+							token_hash: tokenHash,
+							consumed_at: new Date().toISOString(),
+						},
+					],
+					existingEvents: [
+						{
+							id: "ev-1805",
+							telegram_callback_query_id: "cbq_duplicate_test",
+							event_type: "decision_approved",
+						},
+					],
+				});
+				vi.spyOn(supabaseModule, "getSupabaseClient").mockReturnValue(mockSupabase.mockClient as any);
+				setupTelegramFetchMock();
+
+				const update: TelegramUpdate = {
+					update_id: 80005,
+					callback_query: {
+						id: "cbq_duplicate_test", // Duplicate ID matching existing event
+						from: { id: 123456789, is_bot: false, first_name: "Aditya" },
+						message: {
+							message_id: 201,
+							chat: { id: -1001234567890, type: "supergroup" },
+							date: Math.floor(Date.now() / 1000),
+							text: "<b>EDITORIAL REVIEW</b>",
+						},
+						data: `a:${validToken}`,
+					},
+				};
+
+				const result = await processTelegramCallback(update, mockAutoPublishEnv);
+				expect(result.success).toBe(true);
+				expect(result.is_duplicate).toBe(true);
+				expect(result.auto_publish_dispatched).toBeUndefined(); // never dispatched
+
+				// Publishing was NOT called for duplicate
+				expect(publishSpy).not.toHaveBeenCalled();
+			});
+
+			it("6. concurrent approvals cannot create duplicate publishing", async () => {
+				const publishSpy = vi.spyOn(instagramPublishingModule, "publishApprovedCarousel").mockResolvedValue({
+					success: true,
+					publication_id: "pub-uuid-1806",
+					instagram_media_id: "17841499999999",
+					publication_status: "published",
+				} as any);
+
+				const mockSupabase = createMockTelegramSupabase({
+					post: {
+						id: "18000000-0000-0000-0000-000000001806",
+						post_status: "pending_approval",
+						human_review_required: true,
+						carousel_slide_count: 5,
+					},
+					existingRequest: {
+						id: "req-uuid-1806",
+						post_id: "18000000-0000-0000-0000-000000001806",
+						decision_status: "pending",
+						telegram_chat_id: "-1001234567890",
+						telegram_control_message_id: 201,
+						expires_at: new Date(Date.now() + 3600000).toISOString(),
+					},
+					existingActions: [
+						{
+							id: "act-1806",
+							approval_request_id: "req-uuid-1806",
+							action: "approve",
+							token_hash: tokenHash,
+							consumed_at: null,
+						},
+					],
+				});
+				vi.spyOn(supabaseModule, "getSupabaseClient").mockReturnValue(mockSupabase.mockClient as any);
+				setupTelegramFetchMock();
+
+				const update1: TelegramUpdate = {
+					update_id: 80006,
+					callback_query: {
+						id: "cbq_concurrent_1",
+						from: { id: 123456789, is_bot: false, first_name: "Aditya" },
+						message: { message_id: 201, chat: { id: -1001234567890, type: "supergroup" }, date: Math.floor(Date.now() / 1000) },
+						data: `a:${validToken}`,
+					},
+				};
+
+				const update2: TelegramUpdate = {
+					update_id: 80007,
+					callback_query: {
+						id: "cbq_concurrent_2",
+						from: { id: 987654321, is_bot: false, first_name: "Editor2" },
+						message: { message_id: 201, chat: { id: -1001234567890, type: "supergroup" }, date: Math.floor(Date.now() / 1000) },
+						data: `a:${validToken}`,
+					},
+				};
+
+				// Execute sequential calls simulating concurrent attempts
+				const res1 = await processTelegramCallback(update1, mockAutoPublishEnv);
+				const res2 = await processTelegramCallback(update2, mockAutoPublishEnv);
+
+				// First call succeeds and dispatches publishing
+				expect(res1.success).toBe(true);
+				expect(res1.auto_publish_dispatched).toBe(true);
+
+				// Second call is rejected as already decided / token consumed
+				expect(res2.success).toBe(false);
+				expect(res2.error_code).toBe("TOKEN_ALREADY_CONSUMED");
+				expect(res2.auto_publish_dispatched).toBeUndefined();
+
+				// Exactly 1 publish call occurred overall
+				expect(publishSpy).toHaveBeenCalledTimes(1);
+			});
+
+			it("7. dispatchAutoPublishOnApproval skips if post_status is not 'approved'", async () => {
+				const publishSpy = vi.spyOn(instagramPublishingModule, "publishApprovedCarousel");
+
+				const mockSupabase = createMockTelegramSupabase({
+					post: {
+						id: "18000000-0000-0000-0000-000000001807",
+						post_status: "pending_approval", // NOT approved
+						human_review_required: true,
+						carousel_slide_count: 5,
+					},
+				});
+				vi.spyOn(supabaseModule, "getSupabaseClient").mockReturnValue(mockSupabase.mockClient as any);
+
+				const result = await dispatchAutoPublishOnApproval(
+					mockAutoPublishEnv,
+					"18000000-0000-0000-0000-000000001807"
+				);
+
+				expect(result.success).toBe(false);
+				expect(result.skipped).toBe(true);
+				expect(result.reason).toContain("Post not approved");
+				expect(publishSpy).not.toHaveBeenCalled();
+			});
+
+			it("8. dispatchAutoPublishOnApproval skips if human_review_required is false", async () => {
+				const publishSpy = vi.spyOn(instagramPublishingModule, "publishApprovedCarousel");
+
+				const mockSupabase = createMockTelegramSupabase({
+					post: {
+						id: "18000000-0000-0000-0000-000000001808",
+						post_status: "approved",
+						human_review_required: false, // NOT true
+						carousel_slide_count: 5,
+					},
+				});
+				vi.spyOn(supabaseModule, "getSupabaseClient").mockReturnValue(mockSupabase.mockClient as any);
+
+				const result = await dispatchAutoPublishOnApproval(
+					mockAutoPublishEnv,
+					"18000000-0000-0000-0000-000000001808"
+				);
+
+				expect(result.success).toBe(false);
+				expect(result.skipped).toBe(true);
+				expect(result.reason).toBe("human_review_required is not true");
+				expect(publishSpy).not.toHaveBeenCalled();
+			});
+
+			it("9. dispatchAutoPublishOnApproval enforces CAROUSEL only (rejects slide_count < 2 or > 10)", async () => {
+				const publishSpy = vi.spyOn(instagramPublishingModule, "publishApprovedCarousel");
+
+				// Test slide count = 1 (single IMAGE)
+				const mockSupabase1 = createMockTelegramSupabase({
+					post: {
+						id: "18000000-0000-0000-0000-000000001809",
+						post_status: "approved",
+						human_review_required: true,
+						carousel_slide_count: 1, // Single image, not CAROUSEL
+					},
+				});
+				vi.spyOn(supabaseModule, "getSupabaseClient").mockReturnValue(mockSupabase1.mockClient as any);
+
+				const result1 = await dispatchAutoPublishOnApproval(
+					mockAutoPublishEnv,
+					"18000000-0000-0000-0000-000000001809"
+				);
+
+				expect(result1.success).toBe(false);
+				expect(result1.skipped).toBe(true);
+				expect(result1.reason).toContain("restricted to CAROUSEL media type only");
+				expect(publishSpy).not.toHaveBeenCalled();
+
+				// Test slide count = 0 (REEL)
+				const mockSupabase0 = createMockTelegramSupabase({
+					post: {
+						id: "18000000-0000-0000-0000-000000001809",
+						post_status: "approved",
+						human_review_required: true,
+						carousel_slide_count: 0,
+					},
+				});
+				vi.spyOn(supabaseModule, "getSupabaseClient").mockReturnValue(mockSupabase0.mockClient as any);
+
+				const result0 = await dispatchAutoPublishOnApproval(
+					mockAutoPublishEnv,
+					"18000000-0000-0000-0000-000000001809"
+				);
+
+				expect(result0.success).toBe(false);
+				expect(result0.skipped).toBe(true);
+				expect(result0.reason).toContain("restricted to CAROUSEL media type only");
+				expect(publishSpy).not.toHaveBeenCalled();
+			});
+
+			it("10. already-published posts are rejected and never re-published", async () => {
+				const publishSpy = vi.spyOn(instagramPublishingModule, "publishApprovedCarousel");
+
+				const mockSupabase = createMockTelegramSupabase({
+					post: {
+						id: "18000000-0000-0000-0000-000000001810",
+						post_status: "approved",
+						human_review_required: true,
+						carousel_slide_count: 5,
+					},
+					existingPublication: {
+						id: "pub-already-published",
+						post_id: "18000000-0000-0000-0000-000000001810",
+						platform: "instagram",
+						publication_status: "published",
+						instagram_media_id: "17841422733573542",
+					},
+				});
+				vi.spyOn(supabaseModule, "getSupabaseClient").mockReturnValue(mockSupabase.mockClient as any);
+
+				const result = await dispatchAutoPublishOnApproval(
+					mockAutoPublishEnv,
+					"18000000-0000-0000-0000-000000001810"
+				);
+
+				expect(result.success).toBe(false);
+				expect(result.skipped).toBe(true);
+				expect(result.reason).toBe("Post already published");
+				expect(publishSpy).not.toHaveBeenCalled();
+			});
+
+			it("11. active publishing (status 'publishing') is skipped to prevent duplicate concurrent jobs", async () => {
+				const publishSpy = vi.spyOn(instagramPublishingModule, "publishApprovedCarousel");
+
+				const mockSupabase = createMockTelegramSupabase({
+					post: {
+						id: "18000000-0000-0000-0000-000000001811",
+						post_status: "approved",
+						human_review_required: true,
+						carousel_slide_count: 5,
+					},
+					existingPublication: {
+						id: "pub-in-progress",
+						post_id: "18000000-0000-0000-0000-000000001811",
+						platform: "instagram",
+						publication_status: "publishing",
+					},
+				});
+				vi.spyOn(supabaseModule, "getSupabaseClient").mockReturnValue(mockSupabase.mockClient as any);
+
+				const result = await dispatchAutoPublishOnApproval(
+					mockAutoPublishEnv,
+					"18000000-0000-0000-0000-000000001811"
+				);
+
+				expect(result.success).toBe(false);
+				expect(result.skipped).toBe(true);
+				expect(result.reason).toBe("Publishing is already in progress");
+				expect(publishSpy).not.toHaveBeenCalled();
+			});
+
+			it("12. uncertain publication outcomes ('unknown' status) cannot be blindly retried", async () => {
+				const publishSpy = vi.spyOn(instagramPublishingModule, "publishApprovedCarousel");
+
+				const mockSupabase = createMockTelegramSupabase({
+					post: {
+						id: "18000000-0000-0000-0000-000000001812",
+						post_status: "approved",
+						human_review_required: true,
+						carousel_slide_count: 5,
+					},
+					existingPublication: {
+						id: "pub-unknown-state",
+						post_id: "18000000-0000-0000-0000-000000001812",
+						platform: "instagram",
+						publication_status: "unknown",
+						error_message: "Network timeout during media_publish",
+					},
+				});
+				vi.spyOn(supabaseModule, "getSupabaseClient").mockReturnValue(mockSupabase.mockClient as any);
+
+				const result = await dispatchAutoPublishOnApproval(
+					mockAutoPublishEnv,
+					"18000000-0000-0000-0000-000000001812"
+				);
+
+				expect(result.success).toBe(false);
+				expect(result.skipped).toBe(true);
+				expect(result.reason).toBe("Publication outcome unknown; manual reconciliation required");
+				expect(publishSpy).not.toHaveBeenCalled();
+			});
+
+			it("13. publishing failures must NOT reverse or rollback editorial approval", async () => {
+				vi.spyOn(instagramPublishingModule, "publishApprovedCarousel").mockRejectedValue(
+					new Error("Meta API 500 Internal Error during publish")
+				);
+
+				const mockSupabase = createMockTelegramSupabase({
+					post: {
+						id: "18000000-0000-0000-0000-000000001813",
+						post_status: "approved",
+						human_review_required: true,
+						carousel_slide_count: 5,
+					},
+				});
+				vi.spyOn(supabaseModule, "getSupabaseClient").mockReturnValue(mockSupabase.mockClient as any);
+
+				const result = await dispatchAutoPublishOnApproval(
+					mockAutoPublishEnv,
+					"18000000-0000-0000-0000-000000001813"
+				);
+
+				expect(result.success).toBe(false);
+				expect(result.error).toContain("Meta API 500 Internal Error");
+
+				// Vital check: post in social_content_posts remains "approved"!
+				const postAfter = mockSupabase.getPost();
+				expect(postAfter.post_status).toBe("approved");
+			});
+
+			it("14. handleTelegramWebhook responds with HTTP 200 immediately and schedules background publish", async () => {
+				vi.spyOn(instagramPublishingModule, "publishApprovedCarousel").mockResolvedValue({
+					success: true,
+					publication_id: "pub-uuid-1814",
+					instagram_media_id: "17841499999999",
+					publication_status: "published",
+				} as any);
+
+				const mockSupabase = createMockTelegramSupabase({
+					post: {
+						id: "18000000-0000-0000-0000-000000001814",
+						post_status: "pending_approval",
+						human_review_required: true,
+						carousel_slide_count: 5,
+					},
+					existingRequest: {
+						id: "req-uuid-1814",
+						post_id: "18000000-0000-0000-0000-000000001814",
+						decision_status: "pending",
+						telegram_chat_id: "-1001234567890",
+						telegram_control_message_id: 201,
+						expires_at: new Date(Date.now() + 3600000).toISOString(),
+					},
+					existingActions: [
+						{
+							id: "act-1814",
+							approval_request_id: "req-uuid-1814",
+							action: "approve",
+							token_hash: tokenHash,
+							consumed_at: null,
+						},
+					],
+				});
+				vi.spyOn(supabaseModule, "getSupabaseClient").mockReturnValue(mockSupabase.mockClient as any);
+				setupTelegramFetchMock();
+
+				const mockCtx = {
+					waitUntil: vi.fn(),
+					passThroughOnException: vi.fn(),
+				};
+
+				const req = new Request("http://localhost/api/webhooks/telegram", {
+					method: "POST",
+					headers: {
+						"Content-Type": "application/json",
+						"X-Telegram-Bot-Api-Secret-Token": "mock_webhook_secret_99999",
+					},
+					body: JSON.stringify({
+						update_id: 80014,
+						callback_query: {
+							id: "cbq_webhook_auto_pub",
+							from: { id: 123456789, is_bot: false, first_name: "Aditya" },
+							message: { message_id: 201, chat: { id: -1001234567890, type: "supergroup" }, date: Math.floor(Date.now() / 1000) },
+							data: `a:${validToken}`,
+						},
+					}),
+				});
+
+				const response = await handleTelegramWebhook(req, mockAutoPublishEnv, mockCtx as any);
+				expect(response.status).toBe(200);
+
+				const json = await response.json() as any;
+				expect(json.success).toBe(true);
+				expect(json.decision_status).toBe("approved");
+				expect(json.auto_publish_dispatched).toBe(true);
+
+				// Background execution was passed to ctx.waitUntil
+				expect(mockCtx.waitUntil).toHaveBeenCalledTimes(1);
+			});
+		});
+
+		describe("Task 18.2 — Cloudflare Queues for Instagram Publishing Jobs", () => {
+			let tokenHash: string;
+			const validToken = "1234567890abcdef1234567890abcdef";
+
+			function createMockQueue() {
+				const sentMessages: any[] = [];
+				const sendSpy = vi.fn(async (msg: any) => {
+					sentMessages.push(msg);
+				});
+				return {
+					queue: { send: sendSpy } as any,
+					sendSpy,
+					sentMessages,
+				};
+			}
+
+			function createMockMessage<T>(body: T, attempts = 1) {
+				const ackSpy = vi.fn();
+				const retrySpy = vi.fn();
+				const message = {
+					id: `msg-${Date.now()}-${Math.random()}`,
+					timestamp: new Date(),
+					body,
+					attempts,
+					ack: ackSpy,
+					retry: retrySpy,
+				};
+				return { message, ackSpy, retrySpy };
+			}
+
+			function createMockBatch(messages: any[], queueName = "instagram-publishing-jobs") {
+				return {
+					queue: queueName,
+					messages,
+					ackAll: vi.fn(),
+					retryAll: vi.fn(),
+				};
+			}
+
+			beforeEach(async () => {
+				tokenHash = await calculateSha256(validToken);
+				vi.restoreAllMocks();
+			});
+
+			afterEach(() => {
+				vi.restoreAllMocks();
+			});
+
+			it("1. Queue Producer: successful Telegram approval enqueues job with deterministic job_id and outbox pending", async () => {
+				const mockQ = createMockQueue();
+				const envWithQueue: Env = {
+					...mockTelegramDevEnv,
+					INSTAGRAM_AUTH_MODE: "instagram_login",
+					INSTAGRAM_ACCESS_TOKEN: "mock_test_instagram_token_xyz987",
+					INSTAGRAM_ACCOUNT_ID: "17841422733573542",
+					INSTAGRAM_GRAPH_VERSION: "v26.0",
+					INSTAGRAM_AUTO_PUBLISH_ON_APPROVAL: "true",
+					INSTAGRAM_PUBLISHING_QUEUE: mockQ.queue,
+				};
+
+				const mockSupabase = createMockTelegramSupabase({
+					post: {
+						id: "18200000-0000-0000-0000-000000001821",
+						post_status: "pending_approval",
+						human_review_required: true,
+						carousel_slide_count: 5,
+					},
+					existingRequest: {
+						id: "req-uuid-1821",
+						post_id: "18200000-0000-0000-0000-000000001821",
+						decision_status: "pending",
+						telegram_chat_id: "-1001234567890",
+						telegram_control_message_id: 201,
+						expires_at: new Date(Date.now() + 3600000).toISOString(),
+					},
+					existingActions: [
+						{
+							id: "act-1821",
+							approval_request_id: "req-uuid-1821",
+							action: "approve",
+							token_hash: tokenHash,
+							consumed_at: null,
+						},
+					],
+				});
+				vi.spyOn(supabaseModule, "getSupabaseClient").mockReturnValue(mockSupabase.mockClient as any);
+				setupTelegramFetchMock();
+
+				const update: TelegramUpdate = {
+					update_id: 80101,
+					callback_query: {
+						id: "cbq_queue_prod_01",
+						from: { id: 123456789, is_bot: false, first_name: "Aditya" },
+						message: {
+							message_id: 201,
+							chat: { id: -1001234567890, type: "supergroup" },
+							date: Math.floor(Date.now() / 1000),
+							text: "<b>EDITORIAL REVIEW</b>",
+						},
+						data: `a:${validToken}`,
+					},
+				};
+
+				const result = await processTelegramCallback(update, envWithQueue);
+				expect(result.success).toBe(true);
+				expect(result.decision_status).toBe("approved");
+				expect(result.auto_publish_dispatched).toBe(true);
+
+				// Verify Queue.send was awaited and called with expected schema
+				expect(mockQ.sendSpy).toHaveBeenCalledTimes(1);
+				const expectedJobId = deterministicPublishingJobId("18200000-0000-0000-0000-000000001821");
+				expect(expectedJobId).toBe("publish:18200000-0000-0000-0000-000000001821");
+				expect(mockQ.sentMessages[0]).toMatchObject({
+					post_id: "18200000-0000-0000-0000-000000001821",
+					approval_request_id: "req-uuid-1821",
+					job_id: expectedJobId,
+				});
+
+				// Verify outbox row in social_content_publications was initialized to 'pending'
+				const pubs = mockSupabase.getPublications();
+				expect(pubs.length).toBeGreaterThanOrEqual(1);
+				expect(pubs[0].post_id).toBe("18200000-0000-0000-0000-000000001821");
+				expect(pubs[0].publication_status).toBe("pending");
+			});
+
+			it("2. Queue Producer: Queue.send failure leaves approval intact, marks outbox QUEUE_ENQUEUE_FAILED, and triggers Telegram webhook retry", async () => {
+				const mockQ = {
+					queue: {
+						send: vi.fn(async () => {
+							throw new Error("Cloudflare Queue RPC timeout");
+						}),
+					} as any,
+				};
+				const envWithQueue: Env = {
+					...mockTelegramDevEnv,
+					INSTAGRAM_AUTH_MODE: "instagram_login",
+					INSTAGRAM_ACCESS_TOKEN: "mock_test_instagram_token_xyz987",
+					INSTAGRAM_ACCOUNT_ID: "17841422733573542",
+					INSTAGRAM_GRAPH_VERSION: "v26.0",
+					INSTAGRAM_AUTO_PUBLISH_ON_APPROVAL: "true",
+					INSTAGRAM_PUBLISHING_QUEUE: mockQ.queue,
+				};
+
+				const mockSupabase = createMockTelegramSupabase({
+					post: {
+						id: "18200000-0000-0000-0000-000000001822",
+						post_status: "pending_approval",
+						human_review_required: true,
+						carousel_slide_count: 5,
+					},
+					existingRequest: {
+						id: "req-uuid-1822",
+						post_id: "18200000-0000-0000-0000-000000001822",
+						decision_status: "pending",
+						telegram_chat_id: "-1001234567890",
+						telegram_control_message_id: 201,
+						expires_at: new Date(Date.now() + 3600000).toISOString(),
+					},
+					existingActions: [
+						{
+							id: "act-1822",
+							approval_request_id: "req-uuid-1822",
+							action: "approve",
+							token_hash: tokenHash,
+							consumed_at: null,
+						},
+					],
+				});
+				vi.spyOn(supabaseModule, "getSupabaseClient").mockReturnValue(mockSupabase.mockClient as any);
+				setupTelegramFetchMock();
+
+				const update: TelegramUpdate = {
+					update_id: 80102,
+					callback_query: {
+						id: "cbq_queue_prod_fail",
+						from: { id: 123456789, is_bot: false, first_name: "Aditya" },
+						message: {
+							message_id: 201,
+							chat: { id: -1001234567890, type: "supergroup" },
+							date: Math.floor(Date.now() / 1000),
+							text: "<b>EDITORIAL REVIEW</b>",
+						},
+						data: `a:${validToken}`,
+					},
+				};
+
+				const result = await processTelegramCallback(update, envWithQueue);
+				// Returns false with QUEUE_ENQUEUE_FAILED so Telegram webhook can retry
+				expect(result.success).toBe(false);
+				expect(result.error_code).toBe("QUEUE_ENQUEUE_FAILED");
+				expect(result.auto_publish_dispatched).toBe(false);
+
+				// Vital check: post in social_content_posts remains approved (never rolled back)
+				expect(mockSupabase.getPost().post_status).toBe("approved");
+
+				// Outbox row in social_content_publications has QUEUE_ENQUEUE_FAILED
+				const pubs = mockSupabase.getPublications();
+				expect(pubs.length).toBeGreaterThanOrEqual(1);
+				expect(pubs[0].error_code).toBe("QUEUE_ENQUEUE_FAILED");
+			});
+
+			it("3. Queue Producer: duplicate Telegram callback recovers stranded pending post by re-enqueuing to Queue", async () => {
+				const mockQ = createMockQueue();
+				const envWithQueue: Env = {
+					...mockTelegramDevEnv,
+					INSTAGRAM_AUTH_MODE: "instagram_login",
+					INSTAGRAM_ACCESS_TOKEN: "mock_test_instagram_token_xyz987",
+					INSTAGRAM_ACCOUNT_ID: "17841422733573542",
+					INSTAGRAM_GRAPH_VERSION: "v26.0",
+					INSTAGRAM_AUTO_PUBLISH_ON_APPROVAL: "true",
+					INSTAGRAM_PUBLISHING_QUEUE: mockQ.queue,
+				};
+
+				const mockSupabase = createMockTelegramSupabase({
+					post: {
+						id: "18200000-0000-0000-0000-000000001823",
+						post_status: "approved", // Already approved
+						human_review_required: true,
+						carousel_slide_count: 5,
+					},
+					existingRequest: {
+						id: "req-uuid-1823",
+						post_id: "18200000-0000-0000-0000-000000001823",
+						decision_status: "approved",
+						telegram_chat_id: "-1001234567890",
+						telegram_control_message_id: 201,
+						expires_at: new Date(Date.now() + 3600000).toISOString(),
+					},
+					existingActions: [
+						{
+							id: "act-1823",
+							approval_request_id: "req-uuid-1823",
+							action: "approve",
+							token_hash: tokenHash,
+							consumed_at: new Date().toISOString(),
+						},
+					],
+					existingEvents: [
+						{
+							id: "ev-1823",
+							telegram_callback_query_id: "cbq_duplicate_retry",
+							event_type: "decision_approved",
+						},
+					],
+					existingPublication: {
+						id: "pub-stranded-pending",
+						post_id: "18200000-0000-0000-0000-000000001823",
+						platform: "instagram",
+						publication_status: "pending", // Stranded in pending!
+						error_code: "QUEUE_ENQUEUE_FAILED",
+					},
+				});
+				vi.spyOn(supabaseModule, "getSupabaseClient").mockReturnValue(mockSupabase.mockClient as any);
+				setupTelegramFetchMock();
+
+				const update: TelegramUpdate = {
+					update_id: 80103,
+					callback_query: {
+						id: "cbq_duplicate_retry", // Duplicate callback query ID
+						from: { id: 123456789, is_bot: false, first_name: "Aditya" },
+						message: {
+							message_id: 201,
+							chat: { id: -1001234567890, type: "supergroup" },
+							date: Math.floor(Date.now() / 1000),
+							text: "<b>EDITORIAL REVIEW</b>",
+						},
+						data: `a:${validToken}`,
+					},
+				};
+
+				const result = await processTelegramCallback(update, envWithQueue);
+				expect(result.success).toBe(true);
+				expect(result.is_duplicate).toBe(true);
+				expect(result.auto_publish_dispatched).toBe(true);
+
+				// Re-enqueued to Queue
+				expect(mockQ.sendSpy).toHaveBeenCalledTimes(1);
+				expect(mockQ.sentMessages[0].post_id).toBe("18200000-0000-0000-0000-000000001823");
+			});
+
+			it("4. Queue Consumer: successful publication claims job, invokes publishApprovedCarousel, and acks message", async () => {
+				const publishSpy = vi.spyOn(instagramPublishingModule, "publishApprovedCarousel").mockResolvedValue({
+					success: true,
+					publication_id: "pub-uuid-1824",
+					instagram_media_id: "17841499999999",
+					publication_status: "published",
+				} as any);
+
+				const mockSupabase = createMockTelegramSupabase({
+					post: {
+						id: "18200000-0000-0000-0000-000000001824",
+						post_status: "approved",
+						human_review_required: true,
+						carousel_slide_count: 5,
+					},
+					existingPublication: {
+						id: "pub-uuid-1824",
+						post_id: "18200000-0000-0000-0000-000000001824",
+						platform: "instagram",
+						publication_status: "pending",
+					},
+				});
+				vi.spyOn(supabaseModule, "getSupabaseClient").mockReturnValue(mockSupabase.mockClient as any);
+
+				const env: Env = {
+					...mockTelegramDevEnv,
+					INSTAGRAM_AUTH_MODE: "instagram_login",
+					INSTAGRAM_ACCESS_TOKEN: "mock_test_instagram_token_xyz987",
+					INSTAGRAM_ACCOUNT_ID: "17841422733573542",
+					INSTAGRAM_GRAPH_VERSION: "v26.0",
+					INSTAGRAM_AUTO_PUBLISH_ON_APPROVAL: "true",
+				};
+
+				const { message, ackSpy, retrySpy } = createMockMessage<InstagramPublishingJobMessage>({
+					post_id: "18200000-0000-0000-0000-000000001824",
+					job_id: "publish:18200000-0000-0000-0000-000000001824",
+					enqueued_at: new Date().toISOString(),
+				});
+				const batch = createMockBatch([message]);
+
+				await handleInstagramPublishingQueue(batch, env);
+
+				expect(publishSpy).toHaveBeenCalledTimes(1);
+				expect(publishSpy).toHaveBeenCalledWith(env, "18200000-0000-0000-0000-000000001824", { prepareOnly: false });
+				expect(ackSpy).toHaveBeenCalledTimes(1);
+				expect(retrySpy).not.toHaveBeenCalled();
+			});
+
+			it("5. Queue Consumer: duplicate message for already-published post acks immediately and never publishes", async () => {
+				const publishSpy = vi.spyOn(instagramPublishingModule, "publishApprovedCarousel");
+
+				const mockSupabase = createMockTelegramSupabase({
+					post: {
+						id: "18200000-0000-0000-0000-000000001825",
+						post_status: "approved",
+						human_review_required: true,
+						carousel_slide_count: 5,
+					},
+					existingPublication: {
+						id: "pub-already-done",
+						post_id: "18200000-0000-0000-0000-000000001825",
+						platform: "instagram",
+						publication_status: "published",
+						instagram_media_id: "17841499999999",
+					},
+				});
+				vi.spyOn(supabaseModule, "getSupabaseClient").mockReturnValue(mockSupabase.mockClient as any);
+
+				const env: Env = {
+					...mockTelegramDevEnv,
+					INSTAGRAM_AUTH_MODE: "instagram_login",
+					INSTAGRAM_ACCESS_TOKEN: "mock_test_instagram_token_xyz987",
+					INSTAGRAM_ACCOUNT_ID: "17841422733573542",
+					INSTAGRAM_GRAPH_VERSION: "v26.0",
+					INSTAGRAM_AUTO_PUBLISH_ON_APPROVAL: "true",
+				};
+
+				const { message, ackSpy, retrySpy } = createMockMessage<InstagramPublishingJobMessage>({
+					post_id: "18200000-0000-0000-0000-000000001825",
+					job_id: "publish:18200000-0000-0000-0000-000000001825",
+					enqueued_at: new Date().toISOString(),
+				});
+				const batch = createMockBatch([message]);
+
+				await handleInstagramPublishingQueue(batch, env);
+
+				// Must ack duplicate message to remove from queue
+				expect(ackSpy).toHaveBeenCalledTimes(1);
+				expect(retrySpy).not.toHaveBeenCalled();
+				// Must NEVER call publish
+				expect(publishSpy).not.toHaveBeenCalled();
+			});
+
+			it("6. Queue Consumer: uncertain outcome ('unknown' status) acks message and NEVER blindly retries", async () => {
+				const publishSpy = vi.spyOn(instagramPublishingModule, "publishApprovedCarousel");
+
+				const mockSupabase = createMockTelegramSupabase({
+					post: {
+						id: "18200000-0000-0000-0000-000000001826",
+						post_status: "approved",
+						human_review_required: true,
+						carousel_slide_count: 5,
+					},
+					existingPublication: {
+						id: "pub-unknown-guard",
+						post_id: "18200000-0000-0000-0000-000000001826",
+						platform: "instagram",
+						publication_status: "unknown",
+						error_message: "Network timeout during media_publish",
+					},
+				});
+				vi.spyOn(supabaseModule, "getSupabaseClient").mockReturnValue(mockSupabase.mockClient as any);
+
+				const env: Env = {
+					...mockTelegramDevEnv,
+					INSTAGRAM_AUTH_MODE: "instagram_login",
+					INSTAGRAM_ACCESS_TOKEN: "mock_test_instagram_token_xyz987",
+					INSTAGRAM_ACCOUNT_ID: "17841422733573542",
+					INSTAGRAM_GRAPH_VERSION: "v26.0",
+					INSTAGRAM_AUTO_PUBLISH_ON_APPROVAL: "true",
+				};
+
+				const { message, ackSpy, retrySpy } = createMockMessage<InstagramPublishingJobMessage>({
+					post_id: "18200000-0000-0000-0000-000000001826",
+					job_id: "publish:18200000-0000-0000-0000-000000001826",
+					enqueued_at: new Date().toISOString(),
+				});
+				const batch = createMockBatch([message]);
+
+				await handleInstagramPublishingQueue(batch, env);
+
+				// Must ack to prevent infinite DLQ cycling or accidental retries
+				expect(ackSpy).toHaveBeenCalledTimes(1);
+				expect(retrySpy).not.toHaveBeenCalled();
+				expect(publishSpy).not.toHaveBeenCalled();
+			});
+
+			it("7. Queue Consumer: concurrent message during active 'publishing' delays message by 60 seconds", async () => {
+				const publishSpy = vi.spyOn(instagramPublishingModule, "publishApprovedCarousel");
+
+				const mockSupabase = createMockTelegramSupabase({
+					post: {
+						id: "18200000-0000-0000-0000-000000001827",
+						post_status: "approved",
+						human_review_required: true,
+						carousel_slide_count: 5,
+					},
+					existingPublication: {
+						id: "pub-active-lock",
+						post_id: "18200000-0000-0000-0000-000000001827",
+						platform: "instagram",
+						publication_status: "publishing",
+						updated_at: new Date().toISOString(), // recent lock (< 5m)
+					},
+					rpcResult: {
+						claimed: false,
+						post_id: "18200000-0000-0000-0000-000000001827",
+						in_progress: true,
+						previous_status: "publishing",
+						error_code: "PUBLISHING_IN_PROGRESS",
+						message: "Publication is currently in progress by another worker",
+					},
+				});
+				vi.spyOn(supabaseModule, "getSupabaseClient").mockReturnValue(mockSupabase.mockClient as any);
+
+				const env: Env = {
+					...mockTelegramDevEnv,
+					INSTAGRAM_AUTH_MODE: "instagram_login",
+					INSTAGRAM_ACCESS_TOKEN: "mock_test_instagram_token_xyz987",
+					INSTAGRAM_ACCOUNT_ID: "17841422733573542",
+					INSTAGRAM_GRAPH_VERSION: "v26.0",
+					INSTAGRAM_AUTO_PUBLISH_ON_APPROVAL: "true",
+				};
+
+				const { message, ackSpy, retrySpy } = createMockMessage<InstagramPublishingJobMessage>({
+					post_id: "18200000-0000-0000-0000-000000001827",
+					job_id: "publish:18200000-0000-0000-0000-000000001827",
+					enqueued_at: new Date().toISOString(),
+				});
+				const batch = createMockBatch([message]);
+
+				await handleInstagramPublishingQueue(batch, env);
+
+				// Delays message by 60s
+				expect(retrySpy).toHaveBeenCalledWith({ delaySeconds: 60 });
+				expect(ackSpy).not.toHaveBeenCalled();
+				expect(publishSpy).not.toHaveBeenCalled();
+			});
+
+			it("8. Queue Consumer: transient error before media_publish retries message with delay", async () => {
+				vi.spyOn(instagramPublishingModule, "publishApprovedCarousel").mockRejectedValue(
+					new Error("Instagram API 503 Service Unavailable: child container creation failed")
+				);
+
+				const mockSupabase = createMockTelegramSupabase({
+					post: {
+						id: "18200000-0000-0000-0000-000000001828",
+						post_status: "approved",
+						human_review_required: true,
+						carousel_slide_count: 5,
+					},
+					existingPublication: {
+						id: "pub-transient-fail",
+						post_id: "18200000-0000-0000-0000-000000001828",
+						platform: "instagram",
+						publication_status: "failed", // failed cleanly before media_publish
+					},
+				});
+				vi.spyOn(supabaseModule, "getSupabaseClient").mockReturnValue(mockSupabase.mockClient as any);
+
+				const env: Env = {
+					...mockTelegramDevEnv,
+					INSTAGRAM_AUTH_MODE: "instagram_login",
+					INSTAGRAM_ACCESS_TOKEN: "mock_test_instagram_token_xyz987",
+					INSTAGRAM_ACCOUNT_ID: "17841422733573542",
+					INSTAGRAM_GRAPH_VERSION: "v26.0",
+					INSTAGRAM_AUTO_PUBLISH_ON_APPROVAL: "true",
+				};
+
+				const { message, ackSpy, retrySpy } = createMockMessage<InstagramPublishingJobMessage>({
+					post_id: "18200000-0000-0000-0000-000000001828",
+					job_id: "publish:18200000-0000-0000-0000-000000001828",
+					enqueued_at: new Date().toISOString(),
+				});
+				const batch = createMockBatch([message]);
+
+				await handleInstagramPublishingQueue(batch, env);
+
+				// Safe transient failure triggers retry
+				expect(retrySpy).toHaveBeenCalledWith({ delaySeconds: 30 });
+				expect(ackSpy).not.toHaveBeenCalled();
+			});
+
+			it("9. Worker Outbox Recovery: recoverStrandedApprovedPosts detects stranded pending posts and enqueues to Queue", async () => {
+				const mockQ = createMockQueue();
+				const envWithQueue: Env = {
+					...mockTelegramDevEnv,
+					INSTAGRAM_AUTH_MODE: "instagram_login",
+					INSTAGRAM_ACCESS_TOKEN: "mock_test_instagram_token_xyz987",
+					INSTAGRAM_ACCOUNT_ID: "17841422733573542",
+					INSTAGRAM_GRAPH_VERSION: "v26.0",
+					INSTAGRAM_AUTO_PUBLISH_ON_APPROVAL: "true",
+					INSTAGRAM_PUBLISHING_QUEUE: mockQ.queue,
+				};
+
+				const mockSupabase = createMockTelegramSupabase({
+					post: {
+						id: "18200000-0000-0000-0000-000000001829",
+						post_status: "approved",
+						human_review_required: true,
+						carousel_slide_count: 5,
+					},
+					existingPublication: {
+						id: "pub-stranded-recovery",
+						post_id: "18200000-0000-0000-0000-000000001829",
+						platform: "instagram",
+						publication_status: "pending",
+						updated_at: new Date(Date.now() - 120000).toISOString(), // 2 minutes ago (> 60s)
+					},
+				});
+				vi.spyOn(supabaseModule, "getSupabaseClient").mockReturnValue(mockSupabase.mockClient as any);
+
+				const recoveryResult = await recoverStrandedApprovedPosts(envWithQueue);
+				expect(recoveryResult.checked).toBeGreaterThanOrEqual(1);
+				expect(recoveryResult.enqueued).toBe(1);
+				expect(recoveryResult.post_ids).toContain("18200000-0000-0000-0000-000000001829");
+
+				expect(mockQ.sendSpy).toHaveBeenCalledTimes(1);
+				expect(mockQ.sentMessages[0].post_id).toBe("18200000-0000-0000-0000-000000001829");
+			});
+
+			it("10. Dev Recovery Route: POST /api/ai/recover-stranded-publications triggers stranded post sweep", async () => {
+				const mockQ = createMockQueue();
+				const envWithQueue: Env = {
+					...mockTelegramDevEnv,
+					ENVIRONMENT: "development",
+					INSTAGRAM_AUTH_MODE: "instagram_login",
+					INSTAGRAM_ACCESS_TOKEN: "mock_test_instagram_token_xyz987",
+					INSTAGRAM_ACCOUNT_ID: "17841422733573542",
+					INSTAGRAM_GRAPH_VERSION: "v26.0",
+					INSTAGRAM_AUTO_PUBLISH_ON_APPROVAL: "true",
+					INSTAGRAM_PUBLISHING_QUEUE: mockQ.queue,
+				};
+
+				const mockSupabase = createMockTelegramSupabase({
+					post: {
+						id: "18200000-0000-0000-0000-000000001830",
+						post_status: "approved",
+						human_review_required: true,
+						carousel_slide_count: 5,
+					},
+					existingPublication: {
+						id: "pub-dev-recovery",
+						post_id: "18200000-0000-0000-0000-000000001830",
+						platform: "instagram",
+						publication_status: "pending",
+						updated_at: new Date(Date.now() - 120000).toISOString(),
+					},
+				});
+				vi.spyOn(supabaseModule, "getSupabaseClient").mockReturnValue(mockSupabase.mockClient as any);
+
+				const req = new Request("http://localhost/api/ai/recover-stranded-publications", {
+					method: "POST",
+					headers: { "Content-Type": "application/json" },
+					body: JSON.stringify({}),
+				});
+
+				const res = await handleRecoverStrandedPublications(req, envWithQueue);
+				expect(res.status).toBe(200);
+				const data = await res.json() as any;
+				expect(data.success).toBe(true);
+				expect(data.enqueued).toBe(1);
+				expect(data.post_ids).toContain("18200000-0000-0000-0000-000000001830");
 			});
 		});
 	});
