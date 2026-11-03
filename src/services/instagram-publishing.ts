@@ -1159,6 +1159,7 @@ export async function publishApprovedCarousel(
 		customConverter?: (pngBytes: Uint8Array, slideNumber: number) => Promise<Uint8Array>;
 		pollMaxAttempts?: number;
 		pollIntervalMs?: number;
+		claimConfirmed?: boolean;
 	}
 ): Promise<PublishResult> {
 	const prepareOnly = options?.prepareOnly ?? options?.dryRun ?? true;
@@ -1194,7 +1195,7 @@ export async function publishApprovedCarousel(
 			throw new Error("Post has already been published to Instagram. Republishing is prohibited.");
 		}
 
-		if (existingPub.publication_status === "publishing") {
+		if (existingPub.publication_status === "publishing" && !options?.claimConfirmed) {
 			const updatedAtMs = new Date(existingPub.updated_at || existingPub.created_at || Date.now()).getTime();
 			const ageMs = Date.now() - updatedAtMs;
 			if (ageMs < 5 * 60 * 1000) {

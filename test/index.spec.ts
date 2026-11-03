@@ -10935,7 +10935,6 @@ describe("Task 10 - Global Hot Legal Topic Selection Using Groq", () => {
 											single: vi.fn(async () => ({ data: { ...first }, error: null })),
 										})),
 										then: (resolve: any, reject?: any) => Promise.resolve({ data: first, error: null }).then(resolve, reject),
-										catch: (reject: any) => Promise.resolve({ data: first, error: null }).catch(reject),
 									};
 									return insertResult;
 								}),
@@ -10970,10 +10969,6 @@ describe("Task 10 - Global Hot Legal Topic Selection Using Groq", () => {
 										then: (resolve: any, reject?: any) => {
 											applyUpdate();
 											return Promise.resolve({ error: null }).then(resolve, reject);
-										},
-										catch: (reject: any) => {
-											applyUpdate();
-											return Promise.resolve({ error: null }).catch(reject);
 										},
 									};
 									return updateObj;
@@ -15618,7 +15613,10 @@ describe("Task 10 - Global Hot Legal Topic Selection Using Groq", () => {
 				await handleInstagramPublishingQueue(batch, env);
 
 				expect(publishSpy).toHaveBeenCalledTimes(1);
-				expect(publishSpy).toHaveBeenCalledWith(env, "18200000-0000-0000-0000-000000001824", { prepareOnly: false });
+				expect(publishSpy).toHaveBeenCalledWith(env, "18200000-0000-0000-0000-000000001824", {
+					prepareOnly: false,
+					claimConfirmed: true,
+				});
 				expect(ackSpy).toHaveBeenCalledTimes(1);
 				expect(retrySpy).not.toHaveBeenCalled();
 			});
@@ -15888,6 +15886,199 @@ describe("Task 10 - Global Hot Legal Topic Selection Using Groq", () => {
 				expect(data.success).toBe(true);
 				expect(data.enqueued).toBe(1);
 				expect(data.post_ids).toContain("18200000-0000-0000-0000-000000001830");
+			});
+
+			it("13. recordApprovalPublicationOutbox: inserts publication record with status pending when none exists", async () => {
+				const mockSupabase = createMockTelegramSupabase({
+					post: {
+						id: "18200000-0000-0000-0000-000000001831",
+						post_status: "approved",
+						human_review_required: true,
+						carousel_slide_count: 5,
+						instagram_caption: "Test caption for outbox",
+					},
+				});
+
+				await recordApprovalPublicationOutbox(
+					mockSupabase.mockClient as any,
+					mockTelegramDevEnv,
+					"18200000-0000-0000-0000-000000001831",
+					"req-uuid-1831"
+				);
+
+				const pubs = mockSupabase.getPublications();
+				expect(pubs).toHaveLength(1);
+				expect(pubs[0].post_id).toBe("18200000-0000-0000-0000-000000001831");
+				expect(pubs[0].publication_status).toBe("pending");
+				expect(pubs[0].platform).toBe("instagram");
+				expect(pubs[0].caption).toBe("Test caption for outbox");
+				expect(pubs[0].slide_count).toBe(5);
+			});
+
+			it("14. recordApprovalPublicationOutbox: updates failed publication back to pending", async () => {
+				const mockSupabase = createMockTelegramSupabase({
+					post: {
+						id: "18200000-0000-0000-0000-000000001832",
+						post_status: "approved",
+						human_review_required: true,
+						carousel_slide_count: 5,
+					},
+					existingPublication: {
+						id: "pub-failed-1832",
+						post_id: "18200000-0000-0000-0000-000000001832",
+						platform: "instagram",
+						publication_status: "failed",
+						error_code: "TEST_ERR",
+						error_message: "Old error",
+					},
+				});
+
+				await recordApprovalPublicationOutbox(
+					mockSupabase.mockClient as any,
+					mockTelegramDevEnv,
+					"18200000-0000-0000-0000-000000001832"
+				);
+
+				const pubs = mockSupabase.getPublications();
+				expect(pubs).toHaveLength(1);
+				expect(pubs[0].publication_status).toBe("pending");
+				expect(pubs[0].error_code).toBeNull();
+				expect(pubs[0].error_message).toBeNull();
+			});
+
+			it("15. recordApprovalPublicationOutbox: throws and does not swallow error when insertion fails", async () => {
+				const failingSupabase = {
+					from: vi.fn((table: string) => {
+						if (table === "social_content_posts") {
+							return {
+								select: vi.fn(() => ({
+									eq: vi.fn(() => ({
+										single: vi.fn(async () => ({
+											data: {
+												id: "18200000-0000-0000-0000-000000001833",
+												carousel_slide_count: 5,
+											},
+											error: null,
+										})),
+									})),
+								})),
+							};
+						}
+						if (table === "social_content_publications") {
+							return {
+								select: vi.fn(() => ({
+									eq: vi.fn(() => ({
+										eq: vi.fn(() => ({
+											maybeSingle: vi.fn(async () => ({ data: null, error: null })),
+										})),
+									})),
+								})),
+								insert: vi.fn(() => {
+									// Real Supabase query builder returns thenable without catch
+									return {
+										then: (resolve: any) => resolve({ data: null, error: new Error("Database disk full") }),
+									};
+								}),
+							};
+						}
+						return {};
+					}),
+				};
+
+				await expect(
+					recordApprovalPublicationOutbox(
+						failingSupabase as any,
+						mockTelegramDevEnv,
+						"18200000-0000-0000-0000-000000001833"
+					)
+				).rejects.toThrow("Failed to create publication outbox record: Database disk full");
+			});
+
+			it("16. processTelegramCallback: returns QUEUE_ENQUEUE_FAILED when outbox recording throws", async () => {
+				const mockQ = createMockQueue();
+				const envWithQueue: Env = {
+					...mockTelegramDevEnv,
+					INSTAGRAM_AUTH_MODE: "instagram_login",
+					INSTAGRAM_ACCESS_TOKEN: "mock_test_instagram_token_xyz987",
+					INSTAGRAM_ACCOUNT_ID: "17841422733573542",
+					INSTAGRAM_GRAPH_VERSION: "v26.0",
+					INSTAGRAM_AUTO_PUBLISH_ON_APPROVAL: "true",
+					INSTAGRAM_PUBLISHING_QUEUE: mockQ.queue,
+				};
+
+				const mockSupabase = createMockTelegramSupabase({
+					post: {
+						id: "18200000-0000-0000-0000-000000001834",
+						post_status: "pending_approval",
+						human_review_required: true,
+						carousel_slide_count: 5,
+					},
+					existingRequest: {
+						id: "req-uuid-1834",
+						post_id: "18200000-0000-0000-0000-000000001834",
+						decision_status: "pending",
+						telegram_chat_id: "-1001234567890",
+						telegram_control_message_id: 204,
+						expires_at: new Date(Date.now() + 3600000).toISOString(),
+					},
+					existingActions: [
+						{
+							id: "act-1834",
+							request_id: "req-uuid-1834",
+							action: "approve",
+							token_hash: tokenHash,
+							consumed_at: null,
+						},
+					],
+				});
+
+				// Force insert on social_content_publications to fail
+				const originalFrom = mockSupabase.mockClient.from;
+				mockSupabase.mockClient.from = vi.fn((table: string) => {
+					if (table === "social_content_publications") {
+						return {
+							select: vi.fn(() => ({
+								eq: vi.fn(() => ({
+									eq: vi.fn(() => ({
+										maybeSingle: vi.fn(async () => ({ data: null, error: null })),
+									})),
+								})),
+							})),
+							insert: vi.fn(() => ({
+								then: (resolve: any) => resolve({ data: null, error: new Error("Outbox table lock timeout") }),
+							})),
+						};
+					}
+					return originalFrom(table);
+				});
+
+				vi.spyOn(supabaseModule, "getSupabaseClient").mockReturnValue(mockSupabase.mockClient as any);
+
+				const update: TelegramUpdate = {
+					update_id: 99999,
+					callback_query: {
+						id: "cbq-1834",
+						from: {
+							id: 123456789,
+							is_bot: false,
+							first_name: "Editor",
+							username: "test_editor",
+						},
+						message: {
+							message_id: 204,
+							date: Math.floor(Date.now() / 1000),
+							chat: { id: -1001234567890, type: "supergroup" },
+						},
+						data: `a:${validToken}`,
+					},
+				};
+
+				const result = await processTelegramCallback(update, envWithQueue);
+				expect(result.success).toBe(false);
+				expect(result.error_code).toBe("QUEUE_ENQUEUE_FAILED");
+				expect(result.error).toContain("outbox failed");
+				// Queue.send should NOT have been called
+				expect(mockQ.sendSpy).not.toHaveBeenCalled();
 			});
 		});
 	});

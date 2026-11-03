@@ -1008,10 +1008,23 @@ export async function processTelegramCallback(
 		decisionStatus === "approved" &&
 		!isDuplicate &&
 		postId &&
-		env.INSTAGRAM_AUTO_PUBLISH_ON_APPROVAL === "true"
+		isAutoPublishAllowed(env, postId)
 	) {
 		// 8.1. Create durable outbox record in social_content_publications (publication_status = 'pending')
-		await recordApprovalPublicationOutbox(supabase, env, postId, approvalRequestId);
+		try {
+			await recordApprovalPublicationOutbox(supabase, env, postId, approvalRequestId);
+		} catch (outboxErr: any) {
+			console.error(`[Queue Producer] Failed to record publication outbox for post ${postId}:`, outboxErr);
+			return {
+				success: false,
+				post_id: postId,
+				approval_request_id: approvalRequestId,
+				decision_status: decisionStatus,
+				action,
+				error_code: "QUEUE_ENQUEUE_FAILED",
+				error: `Approval succeeded but publication outbox failed: ${outboxErr.message}`,
+			};
+		}
 
 		const deterministicJobId = deterministicPublishingJobId(postId);
 
@@ -1311,8 +1324,9 @@ export async function handleTelegramWebhook(request: Request, env: Env, ctx?: Ex
 
 	try {
 		const result = await processTelegramCallback(update, env, ctx);
+		const httpStatus = (!result.success && result.error_code === "QUEUE_ENQUEUE_FAILED") ? 503 : 200;
 		return new Response(JSON.stringify(result), {
-			status: 200,
+			status: httpStatus,
 			headers: { "Content-Type": "application/json" },
 		});
 	} catch (err: any) {
@@ -1323,6 +1337,22 @@ export async function handleTelegramWebhook(request: Request, env: Env, ctx?: Ex
 			headers: { "Content-Type": "application/json" },
 		});
 	}
+}
+
+/**
+ * Checks whether automated Instagram publishing is permitted for a specific post.
+ * Supports:
+ * 1. Explicit allowlist: INSTAGRAM_AUTO_PUBLISH_POST_ALLOWLIST (comma-separated post UUIDs or single UUID)
+ * 2. Global switch: INSTAGRAM_AUTO_PUBLISH_ON_APPROVAL === "true" (when allowlist is not specified)
+ * Guarantees that in controlled live tests, ONLY the designated allowlisted post can publish.
+ */
+export function isAutoPublishAllowed(env: Env, postId: string): boolean {
+	const allowlist = (env as any).INSTAGRAM_AUTO_PUBLISH_POST_ALLOWLIST?.trim();
+	if (allowlist) {
+		const allowedIds = allowlist.split(",").map((id: string) => id.trim().toLowerCase());
+		return allowedIds.includes(postId.toLowerCase());
+	}
+	return env.INSTAGRAM_AUTO_PUBLISH_ON_APPROVAL === "true";
 }
 
 /**
@@ -1345,25 +1375,33 @@ export async function recordApprovalPublicationOutbox(
 	postId: string,
 	approvalRequestId?: string
 ): Promise<void> {
-	const { data: post } = await supabase
+	const { data: post, error: postErr } = await supabase
 		.from("social_content_posts")
 		.select("*")
 		.eq("id", postId)
 		.single();
 
-	if (!post) return;
+	if (postErr || !post) {
+		console.error(`[Outbox] Post ${postId} not found for outbox recording:`, postErr?.message);
+		throw new Error(`Post ${postId} not found: ${postErr?.message || "Not found"}`);
+	}
 
-	const { data: existingPub } = await supabase
+	const { data: existingPub, error: pubErr } = await supabase
 		.from("social_content_publications")
 		.select("*")
 		.eq("post_id", postId)
 		.eq("platform", "instagram")
 		.maybeSingle();
 
+	if (pubErr) {
+		console.error(`[Outbox] Error checking existing publication for post ${postId}:`, pubErr.message);
+		throw new Error(`Failed to check existing publication: ${pubErr.message}`);
+	}
+
 	const now = new Date().toISOString();
 
 	if (!existingPub) {
-		await supabase
+		const { error: insertErr } = await supabase
 			.from("social_content_publications")
 			.insert({
 				post_id: postId,
@@ -1376,12 +1414,14 @@ export async function recordApprovalPublicationOutbox(
 				retry_count: 0,
 				created_at: now,
 				updated_at: now,
-			})
-			.catch((err: any) => {
-				console.warn("[Outbox] Initial insert into social_content_publications failed:", err.message);
 			});
+
+		if (insertErr) {
+			console.error("[Outbox] Initial insert into social_content_publications failed:", insertErr.message);
+			throw new Error(`Failed to create publication outbox record: ${insertErr.message}`);
+		}
 	} else if (existingPub.publication_status === "failed") {
-		await supabase
+		const { error: updateErr } = await supabase
 			.from("social_content_publications")
 			.update({
 				publication_status: "pending",
@@ -1389,15 +1429,19 @@ export async function recordApprovalPublicationOutbox(
 				error_message: null,
 				updated_at: now,
 			})
-			.eq("id", existingPub.id)
-			.catch(() => {});
+			.eq("id", existingPub.id);
+
+		if (updateErr) {
+			console.error("[Outbox] Update of failed publication to pending failed:", updateErr.message);
+			throw new Error(`Failed to update publication outbox record: ${updateErr.message}`);
+		}
 	}
 }
 
 /**
  * Atomically claims publication work for a post before executing it.
- * Uses PostgreSQL RPC claim_publication_job with row-level locks (FOR UPDATE)
- * when available, falling back to atomic table queries.
+ * Exclusively uses PostgreSQL RPC claim_publication_job with row-level locks (FOR UPDATE).
+ * Fails safely without claiming if the atomic RPC is unavailable.
  */
 export async function claimPublicationJob(
 	supabase: any,
@@ -1413,13 +1457,22 @@ export async function claimPublicationJob(
 	error_code?: string;
 	error?: string;
 }> {
-	// 1. Try PostgreSQL RPC if available
 	try {
 		const res = await supabase.rpc("claim_publication_job", {
 			p_post_id: postId,
 			p_stale_seconds: staleSeconds,
 		});
-		if (!res.error && res.data) {
+
+		if (res.error) {
+			console.error(`[Atomic Claim] claim_publication_job RPC error for post ${postId}:`, res.error.message);
+			return {
+				claimed: false,
+				error_code: "ATOMIC_CLAIM_UNAVAILABLE",
+				error: `Atomic claim RPC failed: ${res.error.message}`,
+			};
+		}
+
+		if (res.data) {
 			const data = typeof res.data === "string" ? JSON.parse(res.data) : res.data;
 			return {
 				claimed: Boolean(data.claimed),
@@ -1432,98 +1485,19 @@ export async function claimPublicationJob(
 				error: data.message,
 			};
 		}
-	} catch {
-		// Fall through to direct table queries
-	}
 
-	// 2. Direct table fallback:
-	const { data: post, error: postErr } = await supabase
-		.from("social_content_posts")
-		.select("*")
-		.eq("id", postId)
-		.single();
-
-	if (postErr || !post) {
-		return { claimed: false, error_code: "POST_NOT_FOUND", error: `Post not found: ${postId}` };
-	}
-
-	if (post.post_status !== "approved") {
-		if (post.post_status === "published" || post.instagram_media_id) {
-			return { claimed: false, is_already_published: true };
-		}
-		return { claimed: false, error_code: "POST_NOT_APPROVED", error: `Post status is ${post.post_status}` };
-	}
-
-	if (post.human_review_required !== true) {
-		return { claimed: false, error_code: "HUMAN_REVIEW_NOT_REQUIRED", error: "human_review_required is not true" };
-	}
-
-	const { data: existingPub } = await supabase
-		.from("social_content_publications")
-		.select("*")
-		.eq("post_id", postId)
-		.eq("platform", "instagram")
-		.maybeSingle();
-
-	const now = new Date().toISOString();
-
-	if (existingPub) {
-		if (existingPub.publication_status === "published" || existingPub.instagram_media_id) {
-			return { claimed: false, is_already_published: true, publication_id: existingPub.id };
-		}
-
-		if (existingPub.publication_status === "unknown") {
-			return { claimed: false, is_unknown: true, publication_id: existingPub.id };
-		}
-
-		if (existingPub.publication_status === "publishing") {
-			const updatedAtMs = new Date(existingPub.updated_at || existingPub.created_at || Date.now()).getTime();
-			const ageMs = Date.now() - updatedAtMs;
-			if (ageMs < staleSeconds * 1000) {
-				return { claimed: false, in_progress: true, publication_id: existingPub.id };
-			}
-		}
-
-		const nextRetry = (existingPub.retry_count || 0) + 1;
-		const { data: updated, error: updateErr } = await supabase
-			.from("social_content_publications")
-			.update({
-				publication_status: "publishing",
-				retry_count: nextRetry,
-				updated_at: now,
-			})
-			.eq("id", existingPub.id)
-			.select()
-			.single();
-
-		if (updateErr) {
-			return { claimed: false, error: updateErr.message };
-		}
-
-		return { claimed: true, is_already_published: false, publication_id: existingPub.id, retry_count: nextRetry };
-	} else {
-		const { data: inserted, error: insertErr } = await supabase
-			.from("social_content_publications")
-			.insert({
-				post_id: postId,
-				platform: "instagram",
-				media_type: "CAROUSEL",
-				publication_status: "publishing",
-				instagram_account_id: "pending_config",
-				caption: post.instagram_caption || "LawBriefly Carousel",
-				slide_count: Number(post.carousel_slide_count) || 5,
-				retry_count: 1,
-				created_at: now,
-				updated_at: now,
-			})
-			.select()
-			.single();
-
-		if (insertErr) {
-			return { claimed: false, error: insertErr.message };
-		}
-
-		return { claimed: true, is_already_published: false, publication_id: inserted?.id, retry_count: 1 };
+		return {
+			claimed: false,
+			error_code: "ATOMIC_CLAIM_EMPTY_RESPONSE",
+			error: "Atomic claim RPC returned no data",
+		};
+	} catch (err: any) {
+		console.error(`[Atomic Claim] Exception calling claim_publication_job RPC for post ${postId}:`, err.message || err);
+		return {
+			claimed: false,
+			error_code: "ATOMIC_CLAIM_EXCEPTION",
+			error: `Atomic claim RPC exception: ${err.message || String(err)}`,
+		};
 	}
 }
 
@@ -1539,7 +1513,7 @@ export async function recoverStrandedApprovedPosts(env: Env): Promise<{
 	post_ids: string[];
 	errors: string[];
 }> {
-	if (env.INSTAGRAM_AUTO_PUBLISH_ON_APPROVAL !== "true" || !env.INSTAGRAM_PUBLISHING_QUEUE) {
+	if (!env.INSTAGRAM_PUBLISHING_QUEUE) {
 		return { success: true, checked: 0, enqueued: 0, recovered_count: 0, post_ids: [], errors: [] };
 	}
 
@@ -1561,6 +1535,10 @@ export async function recoverStrandedApprovedPosts(env: Env): Promise<{
 	const STRANDED_THRESHOLD_MS = 60 * 1000;
 
 	for (const post of approvedPosts) {
+		if (!isAutoPublishAllowed(env, post.id)) {
+			continue;
+		}
+
 		const slideCount = Number(post.carousel_slide_count);
 		if (isNaN(slideCount) || slideCount < 2 || slideCount > 10) {
 			continue;
@@ -1578,6 +1556,12 @@ export async function recoverStrandedApprovedPosts(env: Env): Promise<{
 		if (!pub) {
 			isStranded = true;
 		} else if (pub.publication_status === "pending") {
+			// Bounded recovery sweeps: prevent repeated sweeps from dispatching duplicate jobs indefinitely
+			if ((pub.retry_count || 0) >= 3) {
+				console.warn(`[Outbox Recovery] Post ${post.id} reached maximum recovery sweeps (3). Skipping duplicate enqueue.`);
+				continue;
+			}
+
 			const updatedAtMs = new Date(pub.updated_at || pub.created_at || 0).getTime();
 			if (nowMs - updatedAtMs > STRANDED_THRESHOLD_MS) {
 				isStranded = true;
@@ -1597,7 +1581,10 @@ export async function recoverStrandedApprovedPosts(env: Env): Promise<{
 				if (pub) {
 					await supabase
 						.from("social_content_publications")
-						.update({ updated_at: new Date().toISOString() })
+						.update({
+							updated_at: new Date().toISOString(),
+							retry_count: (pub.retry_count || 0) + 1,
+						})
 						.eq("id", pub.id);
 				} else {
 					await recordApprovalPublicationOutbox(supabase, env, post.id);
@@ -1682,8 +1669,21 @@ export async function handleInstagramPublishingQueue(
 			continue;
 		}
 
+		// Enforce allowlist / auto-publish guard
+		if (!isAutoPublishAllowed(env, postId)) {
+			console.warn(`[Queue Consumer] Post ${postId} is not in the auto-publish allowlist. Acknowledging message without publishing.`);
+			message.ack();
+			continue;
+		}
+
 		// 2. Atomically claim publication work before executing
 		const claim = await claimPublicationJob(supabase, postId);
+
+		if (claim.error_code === "ATOMIC_CLAIM_UNAVAILABLE" || claim.error_code === "ATOMIC_CLAIM_EXCEPTION") {
+			console.warn(`[Queue Consumer] Atomic claim RPC unavailable for post ${postId}: ${claim.error}. Retrying message in 30s.`);
+			message.retry({ delaySeconds: 30 });
+			continue;
+		}
 
 		if (claim.is_already_published) {
 			console.log(`[Queue Consumer] Post ${postId} already marked published in publication records. Acknowledging.`);
@@ -1712,7 +1712,10 @@ export async function handleInstagramPublishingQueue(
 		// 3. Execute publishApprovedCarousel internally
 		try {
 			console.log(`[Queue Consumer] Executing publishApprovedCarousel for post ${postId} (job_id: ${jobId})`);
-			const result = await instagramPublishing.publishApprovedCarousel(env, postId, { prepareOnly: false });
+			const result = await instagramPublishing.publishApprovedCarousel(env, postId, {
+				prepareOnly: false,
+				claimConfirmed: true,
+			});
 
 			if (result.success) {
 				message.ack();

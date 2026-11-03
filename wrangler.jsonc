@@ -13,10 +13,11 @@
 	"upload_source_maps": true,
 	/**
 	 * Cron Triggers (UTC)
-	 * "30 0 * * *" executes daily at 00:30 UTC (06:00 AM IST)
+	 * "30 0 * * *" executes daily at 00:30 UTC (06:00 AM IST) for news sync
+	 * every 15 minutes executes for stranded publishing outbox recovery
 	 */
 	"triggers": {
-		"crons": ["30 0 * * *"]
+		"crons": ["30 0 * * *", "*/15 * * * *"]
 	},
 	"browser": {
 		"binding": "MYBROWSER"

@@ -20,7 +20,7 @@ CREATE OR REPLACE FUNCTION public.claim_publication_job(
 RETURNS JSONB
 LANGUAGE plpgsql
 SECURITY DEFINER
-SET search_path = public
+SET search_path = ''
 AS $$
 DECLARE
     v_post RECORD;
@@ -153,4 +153,12 @@ BEGIN
     END IF;
 END;
 $$;
+
+-- 2. Security Hardening: Revoke default permissions from public, anon, and authenticated
+REVOKE ALL ON FUNCTION public.claim_publication_job(UUID, INT) FROM PUBLIC, anon, authenticated;
+REVOKE EXECUTE ON FUNCTION public.claim_publication_job(UUID, INT) FROM PUBLIC, anon, authenticated;
+
+-- 3. Grant EXECUTE exclusively to service_role (Cloudflare Worker server-side operations only)
+GRANT EXECUTE ON FUNCTION public.claim_publication_job(UUID, INT) TO service_role;
+
 

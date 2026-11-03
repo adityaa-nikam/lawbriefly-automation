@@ -201,7 +201,9 @@ export default {
 	},
 
 	async scheduled(controller: ScheduledController, env: Env, ctx: ExecutionContext): Promise<void> {
-		await handleScheduledNewsSync(controller, env);
+		if (!controller.cron || controller.cron === "30 0 * * *") {
+			await handleScheduledNewsSync(controller, env);
+		}
 		if (env.INSTAGRAM_AUTO_PUBLISH_ON_APPROVAL === "true") {
 			await recoverStrandedApprovedPosts(env).catch((err) => {
 				console.error("[Scheduled] Stranded approved posts recovery error:", err);
