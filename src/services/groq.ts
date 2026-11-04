@@ -70,6 +70,17 @@ For example:
 'Constitutional law' alone is too broad to be a useful topic cluster.
 'New Supreme Court interpretation of digital privacy rights' is a meaningful candidate topic.
 A topic may contain one article when it represents a significant legal development. Do not fabricate additional coverage.
+EMERGENCE STATUS:
+'emergence_status' describes the lifecycle of the reported legal development, NOT the procedural outcome of the underlying case.
+For each topic cluster in topic_clusters, assign 'emergence_status' strictly from the allowed enum:
+- emerging: A genuinely new legal development that has recently arisen.
+- developing: A development whose facts or legal proceedings are actively evolving.
+- ongoing: An established matter or process that remains active.
+- unclear: The available article evidence does not establish which stage applies, or none of the other categories can be confidently justified.
+
+A case being dismissed, settled, rejected, concluded, or decided is an outcome. These words must never be emitted as emergence_status values.
+Do not automatically classify every recently published article as 'emerging'. Base the classification on the actual development and evidence.
+When uncertain or if the evidence does not clearly justify another category, use 'unclear'.
 ARTICLE PROVENANCE:
 Use only the article IDs provided in the input.
 Never invent article IDs.
@@ -631,7 +642,17 @@ export interface GlobalTopicSelectionPromptInput {
 async function executeGroqStructuredRequest<T>(
 	apiKey: string,
 	requestBody: Record<string, unknown>
-): Promise<{ success: true; data: T } | { success: false; status: number; error: string }> {
+): Promise<
+	| { success: true; data: T }
+	| {
+			success: false;
+			status: number;
+		error: string;
+			errorCode?: string;
+			errorMessage?: string;
+			failedGeneration?: string;
+	  }
+> {
 	let response: Response | undefined;
 	const maxRetries = 2;
 
@@ -689,11 +710,28 @@ async function executeGroqStructuredRequest<T>(
 	if (!response || !response.ok) {
 		const status = response ? response.status : 502;
 		let detail = "";
+		let errorCode: string | undefined;
+		let errorMessage: string | undefined;
+		let failedGeneration: string | undefined;
+
 		if (response) {
 			try {
-				const errBody = (await response.json()) as { error?: { message?: string; failed_generation?: string } };
+				const errBody = (await response.json()) as {
+					error?: {
+						message?: string;
+						code?: string;
+						failed_generation?: string;
+					};
+				};
 				if (errBody?.error?.message) {
 					detail = `: ${errBody.error.message}`;
+					errorMessage = errBody.error.message;
+				}
+				if (errBody?.error?.code) {
+					errorCode = errBody.error.code;
+				}
+				if (errBody?.error?.failed_generation) {
+					failedGeneration = errBody.error.failed_generation;
 				}
 				if (status === 400) {
 					console.error("Groq 400 details:", JSON.stringify(errBody));
@@ -728,6 +766,9 @@ async function executeGroqStructuredRequest<T>(
 			success: false,
 			status: 502,
 			error: `Groq API returned HTTP error ${status}${detail}`,
+			errorCode,
+			errorMessage,
+			failedGeneration,
 		};
 	}
 
@@ -825,16 +866,7 @@ export async function callGroqBatchAnalysis(
 		last_seen_at: a.last_seen_at,
 	}));
 
-	const requestBody = {
-		model,
-		messages: [
-			{
-				role: "system",
-				content: GROQ_BATCH_ANALYSIS_SYSTEM_PROMPT,
-			},
-			{
-				role: "user",
-				content: `Analyze the following batch of ${sanitizedArticleInputs.length} articles:
+	const userContent = `Analyze the following batch of ${sanitizedArticleInputs.length} articles:
 
 Instructions:
 1. Provide an assessment for every input article using its exact article_id. Keep each 'reason' concise (1-2 sentences).
@@ -846,10 +878,21 @@ Instructions:
 4. Every article with relevance 'not_relevant' or 'uncertain' MUST have cluster_id set to null, and must NEVER appear in any topic cluster's article_ids list.
 5. For every article that belongs to a topic cluster, its relevance MUST be 'relevant', its cluster_id in article_assessments must match that cluster's cluster_id, and its article_id must be included in that cluster's article_ids list.
 6. Every cluster_id assigned in article_assessments must exist as a cluster in topic_clusters. Keep topic summaries and editorial angles concise.
-7. For each cluster in topic_clusters, you MUST include all properties: cluster_id (string), topic_title (string), topic_summary (string), legal_domain (string enum), jurisdiction (string enum), significance (high, medium, or low), emergence_status (emerging, developing, ongoing, or unclear), editorial_angle (string), article_ids (array of strings containing the supporting article IDs), and confidence (number between 0 and 1). Never omit article_ids.
+7. For each cluster in topic_clusters, you MUST include all properties: cluster_id (string), topic_title (string), topic_summary (string), legal_domain (string enum), jurisdiction (string enum), significance (high, medium, or low), emergence_status (strictly one of: emerging, developing, ongoing, unclear; describes the lifecycle of the reported legal development, NOT procedural case outcomes; if uncertain or if evidence does not clearly justify another category, use unclear), editorial_angle (string), article_ids (array of strings containing the supporting article IDs), and confidence (number between 0 and 1). Never omit article_ids. A case being dismissed, settled, rejected, concluded, or decided is an outcome; these words must never be emitted as emergence_status values.
 
 Articles:
-${JSON.stringify(sanitizedArticleInputs, null, 2)}`,
+${JSON.stringify(sanitizedArticleInputs, null, 2)}`;
+
+	const requestBody = {
+		model,
+		messages: [
+			{
+				role: "system",
+				content: GROQ_BATCH_ANALYSIS_SYSTEM_PROMPT,
+			},
+			{
+				role: "user",
+				content: userContent,
 			},
 		],
 		response_format: {
@@ -865,9 +908,62 @@ ${JSON.stringify(sanitizedArticleInputs, null, 2)}`,
 		reasoning_effort: "low",
 	};
 
-	const result = await executeGroqStructuredRequest<RawGroqBatchAnalysis>(apiKey, requestBody);
+	let result = await executeGroqStructuredRequest<RawGroqBatchAnalysis>(apiKey, requestBody);
+
+	// Bounded corrective retry for strict schema validation errors (e.g. invalid enum generation)
 	if (!result.success) {
-		return result;
+		const isSchemaValidationError =
+			result.errorCode === "json_validate_failed" ||
+			(typeof result.errorMessage === "string" &&
+				(result.errorMessage.includes("does not validate with") ||
+					result.errorMessage.includes("json_validate_failed")));
+
+		if (isSchemaValidationError) {
+		console.warn(
+			`[Groq Batch Analysis] Schema validation failure detected (${result.errorCode || "schema_validation_error"}). Attempting bounded corrective retry with explicit enum reinforcement.`
+		);
+
+		const correctiveUserContent = `${userContent}
+
+CRITICAL SCHEMA CORRECTION FROM PREVIOUS ATTEMPT:
+Your previous output failed strict JSON schema validation:
+${result.errorMessage || "A field value violated the strict schema enum constraints."}
+
+MANDATORY RULES FOR THIS RETRY ATTEMPT:
+1. 'emergence_status' in every topic cluster describes the lifecycle of the reported legal development, NOT the procedural outcome of the underlying case. It must be STRICTLY one of: 'emerging', 'developing', 'ongoing', 'unclear'.
+   - 'emerging': A genuinely new legal development that has recently arisen.
+   - 'developing': A development whose facts or legal proceedings are actively evolving.
+   - 'ongoing': An established matter or process that remains active.
+   - 'unclear': The available article evidence does not establish which stage applies, or none of the other categories can be confidently justified.
+   A case being dismissed, settled, rejected, concluded, or decided is an outcome. These words must never be emitted as emergence_status values (never output outcome labels such as 'cleared', 'dismissed', 'settled', 'resolved', 'concluded').
+   Do not automatically classify every recently published article as 'emerging'. Base the classification on the actual development and evidence. When uncertain, use 'unclear'.
+2. In 'article_assessments', 'relevance' must strictly be one of: 'relevant', 'not_relevant', 'uncertain'.
+3. All other enum fields ('legal_domain', 'jurisdiction', 'significance') must strictly match their allowed schema enum values.`;
+
+		const retryRequestBody = {
+			...requestBody,
+			messages: [
+				{
+					role: "system",
+					content: GROQ_BATCH_ANALYSIS_SYSTEM_PROMPT,
+				},
+				{
+					role: "user",
+					content: correctiveUserContent,
+				},
+			],
+		};
+
+		result = await executeGroqStructuredRequest<RawGroqBatchAnalysis>(apiKey, retryRequestBody);
+		}
+	}
+
+	if (!result.success) {
+		return {
+			success: false,
+			status: result.status,
+			error: result.error,
+		};
 	}
 
 	return {
@@ -1758,7 +1854,7 @@ CRITICAL INSTRUCTIONS FOR THIS GENERATION:
 			},
 		},
 		temperature: 0.2,
-		max_completion_tokens: 6144,
+		max_completion_tokens: 4096,
 		reasoning_effort: "low",
 	};
 

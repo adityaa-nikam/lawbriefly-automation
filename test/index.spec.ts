@@ -2071,6 +2071,214 @@ describe("Task 09 - Groq AI Integration: Batch-Level Legal Analysis & Topic Extr
 		}
 	});
 
+	it("verifies GROQ_BATCH_ANALYSIS_SYSTEM_PROMPT includes explicit definitions for emergence_status enum values", () => {
+		expect(GROQ_BATCH_ANALYSIS_SYSTEM_PROMPT).toContain("EMERGENCE STATUS:");
+		expect(GROQ_BATCH_ANALYSIS_SYSTEM_PROMPT).toContain("emergence_status' describes the lifecycle of the reported legal development, NOT the procedural outcome");
+		expect(GROQ_BATCH_ANALYSIS_SYSTEM_PROMPT).toContain("emerging: A genuinely new legal development that has recently arisen.");
+		expect(GROQ_BATCH_ANALYSIS_SYSTEM_PROMPT).toContain("developing: A development whose facts or legal proceedings are actively evolving.");
+		expect(GROQ_BATCH_ANALYSIS_SYSTEM_PROMPT).toContain("ongoing: An established matter or process that remains active.");
+		expect(GROQ_BATCH_ANALYSIS_SYSTEM_PROMPT).toContain("unclear: The available article evidence does not establish which stage applies, or none of the other categories can be confidently justified.");
+		expect(GROQ_BATCH_ANALYSIS_SYSTEM_PROMPT).toContain("A case being dismissed, settled, rejected, concluded, or decided is an outcome. These words must never be emitted as emergence_status values.");
+		expect(GROQ_BATCH_ANALYSIS_SYSTEM_PROMPT).toContain("Do not automatically classify every recently published article as 'emerging'. Base the classification on the actual development and evidence.");
+		expect(GROQ_BATCH_ANALYSIS_SYSTEM_PROMPT).toContain("When uncertain or if the evidence does not clearly justify another category, use 'unclear'.");
+	});
+
+	it("correctly classifies case dismissal articles with permitted lifecycle emergence_status (using 'unclear' when lifecycle stage is not justified by evidence)", async () => {
+		const dismissalArticle = {
+			id: "art-dismissal-case-101",
+			title: "Miami Federal Judge Dismisses $10 Billion Defamation Lawsuit Against Wall Street Journal",
+			description: "A Miami federal judge threw out former President Donald Trump's $10 billion defamation lawsuit against the Wall Street Journal, dismissing the case permanently with prejudice.",
+			last_seen_at: "2026-11-04T05:00:00Z",
+		};
+
+		let capturedBody: any;
+
+		const validDismissalOutput = {
+			batch_summary: "Evaluation of federal court dismissal of defamation action.",
+			quality_warnings: [],
+			article_assessments: [
+				{
+					article_id: dismissalArticle.id,
+					relevance: "relevant",
+					legal_domain: "civil_law",
+					jurisdiction: "international",
+					reason: "Dismissal of a high-profile defamation action is a notable civil litigation event.",
+					cluster_id: "cluster-dismissal-1",
+				},
+			],
+			topic_clusters: [
+				{
+					cluster_id: "cluster-dismissal-1",
+					topic_title: "Dismissal of Defamation Lawsuit Against Wall Street Journal",
+					topic_summary: "Federal judge in Miami threw out $10 billion defamation suit with prejudice.",
+					legal_domain: "civil_law",
+					jurisdiction: "international",
+					significance: "high",
+					emergence_status: "unclear",
+					editorial_angle: "Standards for high-profile media defamation dismissals under federal law.",
+					article_ids: [dismissalArticle.id],
+					confidence: 0.94,
+				},
+			],
+		};
+
+		vi.spyOn(globalThis, "fetch").mockImplementation(async (input, init) => {
+			const url = typeof input === "string" ? input : input instanceof URL ? input.toString() : (input as Request).url;
+			if (url === GROQ_API_URL) {
+				capturedBody = JSON.parse(init?.body as string);
+				return new Response(
+					JSON.stringify({
+						choices: [{ message: { content: JSON.stringify(validDismissalOutput) } }],
+					}),
+					{ status: 200, headers: { "Content-Type": "application/json" } }
+				);
+			}
+			return new Response("Not Found", { status: 404 });
+		});
+
+		const outcome = await callGroqBatchAnalysis(mockDevEnv, [dismissalArticle]);
+		expect(outcome.success).toBe(true);
+		if (outcome.success) {
+			const cluster = outcome.data.topic_clusters[0];
+			expect(["emerging", "developing", "ongoing", "unclear"]).toContain(cluster.emergence_status);
+			expect(["dismissed", "cleared", "settled", "rejected", "concluded"]).not.toContain(cluster.emergence_status);
+			expect(cluster.emergence_status).toBe("unclear");
+		}
+
+		const systemMessage = capturedBody.messages.find((m: any) => m.role === "system").content;
+		expect(systemMessage).toContain("emergence_status' describes the lifecycle of the reported legal development, NOT the procedural outcome");
+		expect(systemMessage).toContain("A case being dismissed, settled, rejected, concluded, or decided is an outcome");
+		expect(systemMessage).toContain("Do not automatically classify every recently published article as 'emerging'");
+	});
+
+	it("handles invalid enum schema failure (e.g. emergence_status='cleared') by executing bounded corrective retry with explicit enum reinforcement and succeeds", async () => {
+		const articles = createMockArticles(10);
+		const capturedBodies: any[] = [];
+		let callCount = 0;
+
+		const mockGroqValidResponse = {
+			id: "chatcmpl-test-retry-success",
+			choices: [
+				{
+					message: {
+						role: "assistant",
+						content: JSON.stringify(createMockGroqOutput(articles)),
+					},
+				},
+			],
+		};
+
+		vi.spyOn(globalThis, "fetch").mockImplementation(async (input, init) => {
+			const url = typeof input === "string" ? input : input instanceof URL ? input.toString() : (input as Request).url;
+			if (url === GROQ_API_URL) {
+				callCount++;
+				capturedBodies.push(JSON.parse(init?.body as string));
+
+				if (callCount === 1) {
+					return new Response(
+						JSON.stringify({
+							error: {
+								message:
+									"Generated JSON does not match the expected schema. Please adjust your prompt. See 'failed_generation' for more details. Error: jsonschema: '/topic_clusters/5/emergence_status' does not validate with /properties/topic_clusters/items/properties/emergence_status/enum: value must be one of 'emerging', 'developing', 'ongoing', 'unclear'",
+								type: "invalid_request_error",
+								code: "json_validate_failed",
+								failed_generation: '{\"emergence_status\": \"cleared\"}',
+							},
+						}),
+						{ status: 400, headers: { "Content-Type": "application/json" } }
+					);
+				}
+
+				return new Response(JSON.stringify(mockGroqValidResponse), {
+					status: 200,
+					headers: { "Content-Type": "application/json" },
+				});
+			}
+			return new Response("Not Found", { status: 404 });
+		});
+
+		const outcome = await callGroqBatchAnalysis(mockDevEnv, articles);
+		expect(outcome.success).toBe(true);
+		expect(callCount).toBe(2);
+
+		expect(capturedBodies[0].response_format.json_schema.strict).toBe(true);
+		expect(capturedBodies[0].messages[1].content).not.toContain("CRITICAL SCHEMA CORRECTION");
+
+		expect(capturedBodies[1].response_format.json_schema.strict).toBe(true);
+		const retryUserMessage = capturedBodies[1].messages[1].content;
+		expect(retryUserMessage).toContain("CRITICAL SCHEMA CORRECTION FROM PREVIOUS ATTEMPT");
+		expect(retryUserMessage).toContain("emergence_status");
+		expect(retryUserMessage).toContain("emerging");
+		expect(retryUserMessage).toContain("developing");
+		expect(retryUserMessage).toContain("ongoing");
+		expect(retryUserMessage).toContain("unclear");
+		expect(retryUserMessage).toContain("cleared");
+	});
+
+	it("handles invalid enum schema failure when bounded corrective retry also fails", async () => {
+		const articles = createMockArticles(10);
+		let callCount = 0;
+
+		vi.spyOn(globalThis, "fetch").mockImplementation(async (input) => {
+			const url = typeof input === "string" ? input : input instanceof URL ? input.toString() : (input as Request).url;
+			if (url === GROQ_API_URL) {
+				callCount++;
+				return new Response(
+					JSON.stringify({
+						error: {
+							message:
+								"Generated JSON does not match the expected schema. Error: jsonschema: '/topic_clusters/0/emergence_status' does not validate with /properties/topic_clusters/items/properties/emergence_status/enum: value must be one of 'emerging', 'developing', 'ongoing', 'unclear'",
+							type: "invalid_request_error",
+							code: "json_validate_failed",
+						},
+					}),
+					{ status: 400, headers: { "Content-Type": "application/json" } }
+				);
+			}
+			return new Response("Not Found", { status: 404 });
+		});
+
+		const outcome = await callGroqBatchAnalysis(mockDevEnv, articles);
+		expect(outcome.success).toBe(false);
+		expect(callCount).toBe(2);
+		if (!outcome.success) {
+			expect(outcome.status).toBe(502);
+			expect(outcome.error).toContain("Groq API returned HTTP error 400");
+			expect(outcome.error).toContain("emergence_status");
+		}
+	});
+
+	it("strictly does not retry unrelated HTTP 400 errors (e.g. invalid request parameters)", async () => {
+		const articles = createMockArticles(10);
+		let callCount = 0;
+
+		vi.spyOn(globalThis, "fetch").mockImplementation(async (input) => {
+			const url = typeof input === "string" ? input : input instanceof URL ? input.toString() : (input as Request).url;
+			if (url === GROQ_API_URL) {
+				callCount++;
+				return new Response(
+					JSON.stringify({
+						error: {
+							message: "Invalid parameter: max_tokens must be positive",
+							type: "invalid_request_error",
+							code: "invalid_parameter",
+						},
+					}),
+					{ status: 400, headers: { "Content-Type": "application/json" } }
+				);
+			}
+			return new Response("Not Found", { status: 404 });
+		});
+
+		const outcome = await callGroqBatchAnalysis(mockDevEnv, articles);
+		expect(outcome.success).toBe(false);
+		expect(callCount).toBe(1);
+		if (!outcome.success) {
+			expect(outcome.status).toBe(502);
+			expect(outcome.error).toContain("Invalid parameter");
+		}
+	});
+
 	it("handles zero articles in retrieval window without calling Groq", async () => {
 		let groqCalled = false;
 		vi.spyOn(globalThis, "fetch").mockImplementation(async (input) => {
@@ -6445,6 +6653,7 @@ describe("Task 10 - Global Hot Legal Topic Selection Using Groq", () => {
 
 			await generateContentPackage(testEnv, sampleSelectedTopic, extractionData);
 			expect(capturedBody).toBeDefined();
+			expect(capturedBody.max_completion_tokens).toBe(4096);
 			const userPrompt = capturedBody.messages.find((m: any) => m.role === "user").content;
 			expect(userPrompt).toContain(sampleArticle1.id);
 			expect(userPrompt).toContain(sampleSelectedTopic.topic_title);
@@ -7419,6 +7628,47 @@ describe("Task 10 - Global Hot Legal Topic Selection Using Groq", () => {
 				expect(outcome.data.slides.length).toBe(4);
 				expect(outcome.data.slides[0].slide_role).toBe("cover");
 			}
+		});
+
+		it("configures completion token budget of 4096 tokens for content generation to respect TPM limits", async () => {
+			let capturedBody: any;
+			vi.spyOn(globalThis, "fetch").mockImplementation(async (input, init) => {
+				const url = typeof input === "string" ? input : (input as Request).url;
+				if (url.includes("api.groq.com")) {
+					capturedBody = JSON.parse(init?.body as string);
+					return new Response(
+						JSON.stringify({
+							choices: [
+								{
+									message: {
+										content: JSON.stringify(sampleGroqContentResponse),
+									},
+								},
+							],
+						}),
+						{ status: 200, headers: { "Content-Type": "application/json" } }
+					);
+				}
+				return new Response("Not Found", { status: 404 });
+			});
+
+			const outcome = await callGroqContentGeneration(testEnv, {
+				topic: sampleSelectedTopic,
+				articles: [
+					{
+						article_id: sampleArticle1.id,
+						original_title: sampleArticle1.title,
+						source_domain: "menafn.com",
+						content: sampleJinaMarkdown1,
+						content_length: sampleJinaMarkdown1.length,
+						paragraph_count: 3,
+					},
+				],
+			});
+
+			expect(outcome.success).toBe(true);
+			expect(capturedBody).toBeDefined();
+			expect(capturedBody.max_completion_tokens).toBe(4096);
 		});
 
 		describe("Task 13A — Content Accuracy, Claim-Level Evidence & React-First Carousel Alignment", () => {
