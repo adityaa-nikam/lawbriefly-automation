@@ -1,6 +1,7 @@
 import type { Env } from "../index";
 import { fetchLawBrieflyNews, isValidPositiveInteger } from "./lawbriefly";
 import { getSupabaseClient } from "./supabase";
+import { normalizeUnicodeText } from "./jina-reader";
 
 export interface SyncNewsArticlesOptions {
 	days?: number | string;
@@ -183,8 +184,8 @@ export async function executeNewsIngestion(
 		}
 
 		uniqueArticlesMap.set(normalizedUrl, {
-			title: rawItem.title.trim(),
-			description: rawItem.description.trim(),
+			title: normalizeUnicodeText(rawItem.title.trim()),
+			description: normalizeUnicodeText(rawItem.description.trim()),
 			url: normalizedUrl,
 		});
 		validCount++;

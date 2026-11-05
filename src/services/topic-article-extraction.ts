@@ -533,7 +533,7 @@ export async function handleExtractTopicArticles(
 		if (outcome.data) {
 			return new Response(JSON.stringify(outcome.data), {
 				status: outcome.status,
-				headers: { "Content-Type": "application/json" },
+				headers: { "Content-Type": "application/json; charset=utf-8" },
 			});
 		}
 
@@ -544,13 +544,13 @@ export async function handleExtractTopicArticles(
 			}),
 			{
 				status: outcome.status,
-				headers: { "Content-Type": "application/json" },
+				headers: { "Content-Type": "application/json; charset=utf-8" },
 			}
 		);
 	}
 
 	return new Response(JSON.stringify(outcome.data), {
 		status: 200,
-		headers: { "Content-Type": "application/json" },
+		headers: { "Content-Type": "application/json; charset=utf-8" },
 	});
 }

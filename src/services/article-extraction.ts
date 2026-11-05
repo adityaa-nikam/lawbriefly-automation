@@ -1,6 +1,11 @@
 import type { Env } from "../index";
 import { getSupabaseClient } from "./supabase";
-import { extractArticleWithJina, validateArticleUrl, type JinaExtractionSuccess } from "./jina-reader";
+import {
+	extractArticleWithJina,
+	validateArticleUrl,
+	normalizeUnicodeText,
+	type JinaExtractionSuccess,
+} from "./jina-reader";
 
 export const UUID_REGEX = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
@@ -134,8 +139,8 @@ export async function extractArticleById(
 		provider: "jina",
 		article: {
 			article_id: data.id,
-			original_title: data.title,
-			original_description: data.description,
+			original_title: normalizeUnicodeText(data.title),
+			original_description: normalizeUnicodeText(data.description),
 			original_url: data.url,
 			last_seen_at: data.last_seen_at,
 		},
@@ -243,12 +248,12 @@ export async function handleExtractArticle(
 
 		return new Response(JSON.stringify(errorBody), {
 			status: outcome.status,
-			headers: { "Content-Type": "application/json" },
+			headers: { "Content-Type": "application/json; charset=utf-8" },
 		});
 	}
 
 	return new Response(JSON.stringify(outcome.data), {
 		status: 200,
-		headers: { "Content-Type": "application/json" },
+		headers: { "Content-Type": "application/json; charset=utf-8" },
 	});
 }

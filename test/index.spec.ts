@@ -48,6 +48,8 @@ import {
 	validateArticleUrl,
 	countParagraphs,
 	extractArticleWithJina,
+	normalizeUnicodeText,
+	cleanArticleMarkdown,
 	parseIPv6,
 	checkProhibitedIPv4,
 } from "../src/services/jina-reader";
@@ -2277,6 +2279,174 @@ describe("Task 09 - Groq AI Integration: Batch-Level Legal Analysis & Topic Extr
 			expect(outcome.status).toBe(502);
 			expect(outcome.error).toContain("Invalid parameter");
 		}
+	});
+
+	it("handles finish_reason === 'length' as a truncation error without attempting to parse JSON", async () => {
+		const articles = createMockArticles(10);
+		vi.spyOn(globalThis, "fetch").mockImplementation(async (input) => {
+			const url = typeof input === "string" ? input : input instanceof URL ? input.toString() : (input as Request).url;
+			if (url === GROQ_API_URL) {
+				return new Response(
+					JSON.stringify({
+						choices: [
+							{
+								message: { content: '{"batch_summary": "Incomplete...' },
+								finish_reason: "length",
+							},
+						],
+					}),
+					{ status: 200, headers: { "Content-Type": "application/json" } }
+				);
+			}
+			return new Response("Not Found", { status: 404 });
+		});
+
+		const outcome = await callGroqBatchAnalysis(mockDevEnv, articles);
+		expect(outcome.success).toBe(false);
+		if (!outcome.success) {
+			expect(outcome.status).toBe(502);
+			expect(outcome.error).toContain("truncated due to completion token limit");
+			expect(outcome.error).toContain("finish_reason: length");
+		}
+	});
+
+	it("reproduces Batch 2 failure: recovers from legal_domain: 'uncertain' schema violation via bounded corrective retry", async () => {
+		const articles = createMockArticles(10);
+		const capturedBodies: any[] = [];
+		let callCount = 0;
+
+		const validBatch2Output = createMockGroqOutput(articles);
+		validBatch2Output.article_assessments[8] = {
+			article_id: articles[8].id,
+			relevance: "uncertain",
+			legal_domain: "not_applicable",
+			jurisdiction: "india",
+			reason: "Audit finding lacks legal context",
+			cluster_id: null,
+		};
+
+		vi.spyOn(globalThis, "fetch").mockImplementation(async (input, init) => {
+			const url = typeof input === "string" ? input : input instanceof URL ? input.toString() : (input as Request).url;
+			if (url === GROQ_API_URL) {
+				callCount++;
+				capturedBodies.push(JSON.parse(init?.body as string));
+
+				if (callCount === 1) {
+					return new Response(
+						JSON.stringify({
+							error: {
+								message:
+									"Generated JSON does not match the expected schema. Please adjust your prompt. See 'failed_generation' for more details. Error: jsonschema: '/article_assessments/8/legal_domain' does not validate with /properties/article_assessments/items/properties/legal_domain/enum: value must be one of 'constitutional_law', 'criminal_law', 'civil_law', 'corporate_commercial_law', 'intellectual_property', 'technology_data_privacy_law', 'family_law', 'labour_employment_law', 'environmental_law', 'tax_law', 'administrative_regulatory_law', 'international_law', 'legal_education', 'legal_profession', 'other', 'not_applicable'",
+								type: "invalid_request_error",
+								code: "json_validate_failed",
+								failed_generation: '{"article_assessments": [{"article_id": "test", "legal_domain": "uncertain"}]}',
+							},
+						}),
+						{ status: 400, headers: { "Content-Type": "application/json" } }
+					);
+				}
+
+				return new Response(
+					JSON.stringify({
+						choices: [{ message: { content: JSON.stringify(validBatch2Output) } }],
+					}),
+					{ status: 200, headers: { "Content-Type": "application/json" } }
+				);
+			}
+			return new Response("Not Found", { status: 404 });
+		});
+
+		const outcome = await callGroqBatchAnalysis(mockDevEnv, articles);
+		expect(outcome.success).toBe(true);
+		expect(callCount).toBe(2);
+
+		const retryUserMessage = capturedBodies[1].messages[1].content;
+		expect(retryUserMessage).toContain("CRITICAL: 'uncertain' is NOT a legal_domain; NEVER output 'legal_domain': 'uncertain'");
+		expect(retryUserMessage).toContain("When 'relevance' is 'not_relevant' or 'uncertain', 'legal_domain' must be 'not_applicable' or 'other'");
+	});
+
+	it("reproduces Batch 2 retry failure: recovers from 'Failed to generate JSON' malformed syntax via bounded corrective retry", async () => {
+		const articles = createMockArticles(10);
+		const capturedBodies: any[] = [];
+		let callCount = 0;
+
+		const validBatchOutput = createMockGroqOutput(articles);
+
+		vi.spyOn(globalThis, "fetch").mockImplementation(async (input, init) => {
+			const url = typeof input === "string" ? input : input instanceof URL ? input.toString() : (input as Request).url;
+			if (url === GROQ_API_URL) {
+				callCount++;
+				capturedBodies.push(JSON.parse(init?.body as string));
+
+				if (callCount === 1) {
+					return new Response(
+						JSON.stringify({
+							error: {
+								message: "Failed to generate JSON. Please adjust your prompt. See 'failed_generation' for more details.",
+								type: "invalid_request_error",
+								code: "json_validate_failed",
+								failed_generation: '{"confidence": 0. nine}',
+							},
+						}),
+						{ status: 400, headers: { "Content-Type": "application/json" } }
+					);
+				}
+
+				return new Response(
+					JSON.stringify({
+						choices: [{ message: { content: JSON.stringify(validBatchOutput) } }],
+					}),
+					{ status: 200, headers: { "Content-Type": "application/json" } }
+				);
+			}
+			return new Response("Not Found", { status: 404 });
+		});
+
+		const outcome = await callGroqBatchAnalysis(mockDevEnv, articles);
+		expect(outcome.success).toBe(true);
+		expect(callCount).toBe(2);
+
+		const retryUserMessage = capturedBodies[1].messages[1].content;
+		expect(retryUserMessage).toContain("confidence' must strictly be a decimal numeric literal with digits only between 0.0 and 1.0 (e.g. 0.90). NEVER spell out words like 'nine'");
+	});
+
+	it("verifies GROQ_BATCH_ANALYSIS_SYSTEM_PROMPT instructs that 'uncertain' is NOT a legal_domain and confidence must be numeric digits", () => {
+		expect(GROQ_BATCH_ANALYSIS_SYSTEM_PROMPT).toContain("CRITICAL: 'uncertain' is NOT a legal domain. Never assign 'legal_domain': 'uncertain'.");
+		expect(GROQ_BATCH_ANALYSIS_SYSTEM_PROMPT).toContain("CONFIDENCE:");
+		expect(GROQ_BATCH_ANALYSIS_SYSTEM_PROMPT).toContain("decimal digits only. Never spell out numbers or write words (never output 'nine', 'zero point nine', etc.).");
+	});
+
+	it("verifies secret safety: Groq 400 logging does not leak API keys or authorization headers", async () => {
+		const articles = createMockArticles(10);
+		const errorLogs: string[] = [];
+		const spyConsoleError = vi.spyOn(console, "error").mockImplementation((...args) => {
+			errorLogs.push(args.join(" "));
+		});
+
+		vi.spyOn(globalThis, "fetch").mockImplementation(async (input) => {
+			const url = typeof input === "string" ? input : input instanceof URL ? input.toString() : (input as Request).url;
+			if (url === GROQ_API_URL) {
+				return new Response(
+					JSON.stringify({
+						error: {
+							message: "Failed to generate JSON. Please adjust your prompt. See 'failed_generation' for more details.",
+							type: "invalid_request_error",
+							code: "json_validate_failed",
+						},
+					}),
+					{ status: 400, headers: { "Content-Type": "application/json" } }
+				);
+			}
+			return new Response("Not Found", { status: 404 });
+		});
+
+		await callGroqBatchAnalysis(mockDevEnv, articles);
+		expect(errorLogs.length).toBeGreaterThan(0);
+		for (const log of errorLogs) {
+			expect(log).not.toContain("gsk_test_api_key_12345");
+			expect(log).not.toContain("Bearer");
+		}
+		spyConsoleError.mockRestore();
 	});
 
 	it("handles zero articles in retrieval window without calling Groq", async () => {
@@ -4875,6 +5045,242 @@ describe("Task 10 - Global Hot Legal Topic Selection Using Groq", () => {
 				expect(json.extraction.format).toBe("markdown");
 				expect(json.extraction.extracted_at).toBeDefined();
 			});
+		});
+	});
+
+
+	describe("Article Extraction Quality Hardening (Mojibake Normalization & Boilerplate Stripping)", () => {
+		const sanitizedLawTrendFixture = `*   [Login](https://lawtrend.in/login)
+*   [Download App](https://lawtrend.page.link/app)
+*   [VIP Membership- Subscribe Now](https://lawtrend.in/subscribe-to-law-trend-vip-membership/)
+*   [Court Updates](https://lawtrend.in/category/court-updates/)
+
+Search
+
+[![Image 1: Law Trend- Legal News Website](https://lawtrend.in/wp-content/uploads/2021/04/logo-h.png)Law Trend The Line of Law](https://lawtrend.in/ "Law Trend- Legal News Website")
+
+*   [Home](https://lawtrend.in/)
+*   [Get VIP Membership](https://lawtrend.in/subscribe-to-law-trend-vip-membership/)
+
+[VIP MEMBER LOGIN](https://lawtrend.in/login "VIP MEMBER LOGIN")
+
+# Supreme Court Seeks Responses on Traders’ Plea Against Anti-CEC Protest, Says Protest Sites Cannot Be Occupied Indefinitely
+
+By[Law Trend](https://lawtrend.in/author/admin/)
+
+November 3, 2026 2:04 PM
+
+[Facebook](https://www.facebook.com/sharer.php)[WhatsApp](https://api.whatsapp.com)[Twitter](https://twitter.com)[Print](https://print.com)[Pinterest](https://pinterest.com)
+
+The Supreme Court on Tuesday sought responses from the Centre and other parties on a petition filed by traders’ organisations seeking restrictions on the ongoing protest against the Chief Election Commissioner (CEC) during the festive season. The Court observed that designated protest sites cannot remain occupied indefinitely and that different groups must have an opportunity to exercise their right to protest.
+
+A three-judge Bench comprising Chief Justice of India Surya Kant and Justices Joymalya Bagchi and V Mohana was hearing a batch of petitions concerning the protest at Delhi’s Ramlila Maidan and related issues.
+
+The Bench emphasised that while everyone has the right to protest, the use of designated spaces must be regulated through specified time periods to ensure access for other groups, including farmers and journalists.
+
+[READ ALSO Supreme Court Awards Rs 7.5 Lac as Compensation to a Rape Convict Who Was Imprisoned in Excess to his Punishment](https://lawtrend.in/supreme-court-awards-rs-7-5-lac-as-compensation-to-a-rape-convict-who-was-imprisoned-in-excess-to-his-punishment/)
+
+**Traders Allege Business Losses Due to Protest**
+
+The Kirana Committee Delhi, one of the petitioners, alleged that the continuing demonstration had adversely affected commercial activities in areas surrounding Ramlila Maidan.
+
+Senior advocate Mukul Rohatgi, representing the traders, submitted that approximately 50 lakh people reside in areas near the protest site. He claimed that shops remained closed and that Connaught Place had virtually no visitors.
+
+The traders’ organisations sought intervention to prevent the protest from continuing throughout the festive season, citing its impact on local businesses.
+
+[READ ALSO Justice Chandrachud Says that he personally checks all emails for expeditious hearing](https://lawtrend.in/justice-chandrachud-says-that-he-personally-checks-all-emails-for-expeditious-hearing/)
+
+**Court Directs Traders to Include Protest Organisers as Parties**
+
+During the proceedings, the Supreme Court asked the traders’ bodies to implead the organisations conducting the anti-CEC demonstration.
+
+The Bench made it clear that the Court could not adjudicate the grievances raised by traders without hearing the protesting organisations.
+
+It also stressed the need to balance the right to demonstrate with the availability of public protest spaces for other sections of society.
+
+**Other Petitions Raise Allegations of Police Action and Restrictions**
+
+Apart from the traders’ petition, the Bench was considering pleas raising allegations of mass detentions, police brutality, closure of Metro stations and internet shutdowns.
+
+[READ ALSO HC Directs Police Chief to Resolve an Issue Where a Person Received Wrong Laptop from Flipkart](https://lawtrend.in/hc-directs-police-chief-to-resolve-an-issue-where-a-person-received-wrong-laptop-from-flipkart/)
+
+The proceedings also follow an October 15 order in which the Supreme Court sought responses from the Election Commission and other parties on a petition filed by Congress leader Rahul Gandhi and 12 opposition leaders.
+
+That petition raised allegations of large-scale deletion of voters’ names and irregularities in the Special Intensive Revision (SIR) exercise.
+
+The hearing in the present batch of petitions was continuing at the time of reporting.
+
+[Law Trend on WhatsApp Get the latest judgments & legal updates first Join Now →](https://chat.whatsapp.com/test)
+
+*   Tags
+*   [Supreme Court](https://lawtrend.in/tag/supreme-court/)
+
+Share
+
+[Facebook](https://www.facebook.com/sharer.php)[WhatsApp](https://api.whatsapp.com)
+
+Previous article
+
+[Bombay High Court Directs BMC to Restore Dia Mirza’s Diwali Awareness Video](https://lawtrend.in/bombay-high-court/)
+
+#### Related Articles
+
+### [Azam Khan Moves Supreme Court Against ED Arrest](https://lawtrend.in/azam-khan/)
+
+#### Latest Articles
+
+### [DA arrears dispute: Supreme Court stays contempt](https://lawtrend.in/da-arrears/)
+
+*   [About Us](https://lawtrend.in/about-us/)
+*   [Privacy Policy](https://lawtrend.in/privacy-policy/)
+
+© Newspaper WordPress Theme by TagDiv
+
+Law Trend VIP Membership
+
+## Read the law, ad-free.
+
+That’s about ₹46 a month for full access.
+
+[Get VIP Access →](https://lawtrend.in/subscribe/)
+
+CLOSE
+
+×`;
+
+		it("Regression 1: correctly preserves curly apostrophes, quotation marks, and Unicode punctuation", () => {
+			const text = "The Bench observed: ‘The Court cannot adjudicate without hearing the petitioners’ submissions.’ It noted “designated protest sites”.";
+			expect(normalizeUnicodeText(text)).toBe(text);
+		});
+
+		it("Regression 2: correctly preserves rupee symbols, em dashes, en dashes, and ellipses", () => {
+			const text = "The registration fee was ₹500 — representing a 10% hike – for all members…";
+			expect(normalizeUnicodeText(text)).toBe(text);
+		});
+
+		it("Regression 3: detects and repairs already-corrupted text (Mojibake) at ingestion boundaries", () => {
+			const corrupted = "Tradersâ organisations at Delhiâs Ramlila Maidan paid â¹46 or â‚¹500 â€” case noted.";
+			const expected = "Traders’ organisations at Delhi’s Ramlila Maidan paid ₹46 or ₹500 — case noted.";
+			expect(normalizeUnicodeText(corrupted)).toBe(expected);
+		});
+
+		it("Regression 3b: does not corrupt valid foreign words containing circumflex (â)", () => {
+			const validWords = "Le château de Versailles abrite un crâne et un théâtre d'époque.";
+			expect(normalizeUnicodeText(validWords)).toBe(validWords);
+		});
+
+		it("Regression 4: removes website navigation menus, login links, and advertisements", () => {
+			const cleaned = cleanArticleMarkdown(sanitizedLawTrendFixture, {
+				title: "Supreme Court Seeks Responses on Traders’ Plea Against Anti-CEC Protest",
+			});
+			expect(cleaned).not.toContain("[Login](https://lawtrend.in/login)");
+			expect(cleaned).not.toContain("VIP Membership");
+			expect(cleaned).not.toContain("[Facebook](https://www.facebook.com/sharer.php");
+			expect(cleaned).not.toContain("[READ ALSO");
+			expect(cleaned).not.toContain("© Newspaper WordPress Theme");
+			expect(cleaned).not.toContain("Expiration Popup");
+		});
+
+		it("Regression 5 & 9: preserves complete substantive article body, legal facts, allegations, and court observations", () => {
+			const cleaned = cleanArticleMarkdown(sanitizedLawTrendFixture, {
+				title: "Supreme Court Seeks Responses on Traders’ Plea Against Anti-CEC Protest",
+			});
+			expect(cleaned).toContain("A three-judge Bench comprising Chief Justice of India Surya Kant and Justices Joymalya Bagchi and V Mohana");
+			expect(cleaned).toContain("Senior advocate Mukul Rohatgi, representing the traders, submitted that approximately 50 lakh people reside in areas near the protest site.");
+			expect(cleaned).toContain("The Kirana Committee Delhi, one of the petitioners, alleged that the continuing demonstration had adversely affected commercial activities");
+			expect(cleaned).toContain("That petition raised allegations of large-scale deletion of voters’ names and irregularities in the Special Intensive Revision (SIR) exercise.");
+			expect(cleaned).toContain("The Court observed that designated protest sites cannot remain occupied indefinitely");
+		});
+
+		it("Regression 6: preserves article title heading, byline, and publication date", () => {
+			const cleaned = cleanArticleMarkdown(sanitizedLawTrendFixture, {
+				title: "Supreme Court Seeks Responses on Traders’ Plea Against Anti-CEC Protest",
+			});
+			expect(cleaned).toContain("# Supreme Court Seeks Responses on Traders’ Plea Against Anti-CEC Protest, Says Protest Sites Cannot Be Occupied Indefinitely");
+			expect(cleaned).toContain("By[Law Trend](https://lawtrend.in/author/admin/)");
+			expect(cleaned).toContain("November 3, 2026 2:04 PM");
+			expect(cleaned).toContain("**Traders Allege Business Losses Due to Protest**");
+			expect(cleaned).toContain("**Court Directs Traders to Include Protest Organisers as Parties**");
+		});
+
+		it("Regression 7: removes duplicate paragraphs and collapses repeated content", () => {
+			const duplicateContent = `# Test Title\n\nFirst paragraph of legal analysis.\n\nFirst paragraph of legal analysis.\n\nSecond paragraph with conclusion.`;
+			const cleaned = cleanArticleMarkdown(duplicateContent);
+			expect(cleaned).toBe(`# Test Title\n\nFirst paragraph of legal analysis.\n\nSecond paragraph with conclusion.`);
+		});
+
+		it("Regression 8: extractArticleWithJina automatically cleans boilerplate and returns substantive content length and paragraph counts", async () => {
+			vi.spyOn(globalThis, "fetch").mockImplementation(async () => {
+				return new Response(
+					JSON.stringify({
+						code: 200,
+						data: {
+							title: "Supreme Court Seeks Responses on Traders’ Plea Against Anti-CEC Protest",
+							url: "https://lawtrend.in/test",
+							content: sanitizedLawTrendFixture,
+						},
+					}),
+					{ status: 200, headers: { "Content-Type": "application/json" } }
+				);
+			});
+
+			const res = await extractArticleWithJina("https://lawtrend.in/test", "test-key");
+			expect(res.success).toBe(true);
+			if (res.success) {
+				// Raw fixture was over 4400 chars; cleaned is around 2844 chars
+				expect(res.content.length).toBeLessThan(sanitizedLawTrendFixture.length);
+				expect(res.content).not.toContain("[Login]");
+				expect(res.content).not.toContain("VIP Membership");
+				expect(res.content).toContain("A three-judge Bench comprising Chief Justice of India Surya Kant");
+				expect(res.paragraph_count).toBeGreaterThanOrEqual(10);
+			}
+		});
+
+		it("Regression 8b: HTTP responses return Content-Type with charset=utf-8", async () => {
+			vi.spyOn(globalThis, "fetch").mockImplementation(async (input) => {
+				const url = typeof input === "string" ? input : (input as Request).url;
+				if (url.includes("/rest/v1/news_articles")) {
+					return new Response(JSON.stringify({
+						id: "1d5fd141-4aab-4d35-930b-23617ba0fcc9",
+						title: "Tradersâ organisations plea",
+						description: "Delhiâs Ramlila Maidan case",
+						url: "https://lawtrend.in/test",
+						last_seen_at: "2026-11-04T01:05:45.000Z",
+					}), { status: 200, headers: { "Content-Type": "application/json" } });
+				}
+				if (url === JINA_READER_API_URL) {
+					return new Response(
+						JSON.stringify({
+							code: 200,
+							data: {
+								title: "Tradersâ organisations plea",
+								url: "https://lawtrend.in/test",
+								content: sanitizedLawTrendFixture,
+							},
+						}),
+						{ status: 200, headers: { "Content-Type": "application/json" } }
+					);
+				}
+				return new Response("Not Found", { status: 404 });
+			});
+
+			const req = new IncomingRequest("http://example.com/api/ai/extract-article", {
+				method: "POST",
+				headers: { "Content-Type": "application/json" },
+				body: JSON.stringify({ article_id: "1d5fd141-4aab-4d35-930b-23617ba0fcc9" }),
+			});
+			const ctx = createExecutionContext();
+			const res = await worker.fetch(req, mockDevEnv, ctx);
+			await waitOnExecutionContext(ctx);
+
+			expect(res.status).toBe(200);
+			expect(res.headers.get("Content-Type")).toContain("charset=utf-8");
+
+			const json = (await res.json()) as any;
+			expect(json.success).toBe(true);
+			// Mojibake in title and description repaired:
+			expect(json.article.original_title).toBe("Traders’ organisations plea");
+			expect(json.article.original_description).toBe("Delhi’s Ramlila Maidan case");
 		});
 	});
 

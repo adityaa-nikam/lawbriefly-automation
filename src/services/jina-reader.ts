@@ -317,6 +317,173 @@ export function countParagraphs(content: string): number {
 }
 
 /**
+ * Normalizes text to repair common Mojibake and character encoding corruptions
+ * arising from UTF-8 bytes being decoded as ISO-8859-1 or Windows-1252.
+ * Safely preserves legitimate Unicode characters (curly quotes, dashes, rupee sign)
+ * and preserves valid foreign words containing circumflexes (e.g., château, crâne).
+ */
+export function normalizeUnicodeText(text: string): string {
+	if (!text || typeof text !== "string") {
+		return text;
+	}
+
+	let cleaned = text
+		// Quotes and apostrophes
+		.replace(/â€™/g, "’")
+		.replace(/â€˜/g, "‘")
+		.replace(/â€œ/g, "“")
+		.replace(/â€ /g, "”")
+		.replace(/â€\x9d/g, "”")
+		.replace(/\u00E2\u0080\u0099/g, "’")
+		.replace(/\u00E2\u0080\u0098/g, "‘")
+		.replace(/\u00E2\u0080\u009C/g, "“")
+		.replace(/\u00E2\u0080\u009D/g, "”")
+		// Dashes and hyphens
+		.replace(/â€”/g, "—")
+		.replace(/â€“/g, "–")
+		.replace(/\u00E2\u0080\u0094/g, "—")
+		.replace(/\u00E2\u0080\u0093/g, "–")
+		// Indian Rupee symbol
+		.replace(/â‚¹/g, "₹")
+		.replace(/\u00E2\u0082\u00B9/g, "₹")
+		.replace(/â¹(?=\d)/g, "₹")
+		// Ellipsis
+		.replace(/â€¦/g, "…")
+		.replace(/\u00E2\u0080\u00A6/g, "…")
+		// Non-breaking space and stray C2 characters
+		.replace(/Â\s/g, " ")
+		.replace(/Â(?=[©®₹£€$])/g, "")
+		.replace(/\u00C2\u00A0/g, " ")
+		// Specific possessives where C1 control bytes (0x80, 0x99) were stripped:
+		// e.g. "Delhiâs" -> "Delhi’s", "Courtâs" -> "Court’s"
+		.replace(/([a-zA-Z])âs\b/g, "$1’s")
+		// Plural possessives where apostrophe follows 's':
+		// e.g. "Tradersâ organisations" -> "Traders’ organisations", "farmersâ rights" -> "farmers’ rights"
+		.replace(/([a-zA-Z]s)â(?=\s+[a-z])/g, "$1’");
+
+	return cleaned;
+}
+
+/**
+ * Deterministically strips website boilerplate from extracted Markdown:
+ * - Pre-article navigation menus, search bars, login prompts, and site logos.
+ * - Social sharing link bars ([Facebook], [WhatsApp], [Twitter], etc.).
+ * - Inline related article links ([READ ALSO ...], [ALSO READ ...]).
+ * - Promotional banners and channel links (Join WhatsApp / Telegram).
+ * - Post-article footer boilerplate: Tags, Related Articles, Latest Articles,
+ *   VIP membership sales, copyright notices, and popup dialogs.
+ * - Duplicate blocks and paragraphs.
+ *
+ * Preserves the complete substantive legal article body:
+ * - Article title (H1), author, publication timestamp.
+ * - Main narrative paragraphs, procedural facts, and court observations.
+ * - Substantive section subheadings (**Heading** or ## Heading).
+ * - Quotes from judges, advocates, and litigants.
+ * - Legal citations, references to statutory bodies, orders, and parties.
+ */
+export function cleanArticleMarkdown(
+	rawMarkdown: string,
+	options: { title?: string } = {}
+): string {
+	if (!rawMarkdown || typeof rawMarkdown !== "string") {
+		return "";
+	}
+
+	const { title } = options;
+
+	let content = rawMarkdown.replace(/\r\n/g, "\n").replace(/\r/g, "\n");
+
+	// 1. Remove pre-article navigation and website header
+	// If an H1 title is found, slice content from the start of the H1
+	const h1Match = content.match(/^#\s+(.+)$/m);
+	if (h1Match) {
+		const h1Index = content.indexOf(h1Match[0]);
+		if (
+			h1Match[1].length > 15 ||
+			(title && h1Match[1].toLowerCase().includes(title.slice(0, 20).toLowerCase()))
+		) {
+			content = content.slice(h1Index);
+		}
+	}
+
+	// 2. Split into markdown blocks
+	const rawBlocks = content.split(/\n\s*\n/);
+	const cleanedBlocks: string[] = [];
+
+	const isTerminalFooterMarker = (block: string): boolean => {
+		// Tags section (e.g. "* Tags", "### Tags", "Tags")
+		if (/^(\*|\-|\#+)?\s*Tags\b/i.test(block)) return true;
+		// Social share header
+		if (/^(Share|Share this (?:post|article|story))\b/i.test(block)) return true;
+		// Previous / Next article navigation
+		if (/^(Previous (?:article|story|post)|Next (?:article|story|post))\b/i.test(block)) return true;
+		// Related / Latest articles section
+		if (/^#{1,6}\s*(?:Related Articles|Latest Articles|Trending Stories|Recent Posts|You May Also Like|More From|Top Stories)\b/i.test(block)) return true;
+		// Subscription / VIP / Membership promos
+		if (/(?:VIP Membership|Read the law, ad-free|That’s about ₹|That's about ₹|lock in ₹|SAVE \d+%|Expiration Popup)/i.test(block)) return true;
+		// WordPress theme or copyright footer
+		if (/(?:Newspaper WordPress Theme|Copyright ©|All rights reserved|© \d{4})/i.test(block)) return true;
+		// Footer navigation menus
+		if (/^\*\s+\[(?:About Us|Privacy Policy|Terms of use|Refund Policy|Contact Us|Login Now|My Account)\]/i.test(block)) return true;
+		return false;
+	};
+
+	const isInlineNoise = (block: string): boolean => {
+		// Standalone social sharing buttons: [Facebook](...), [WhatsApp](...), etc.
+		if (/^(\s*(\[(?:Facebook|Twitter|WhatsApp|Print|Pinterest|Telegram|Instagram|Linkedin|Share|Email)\]\([^\)]*\))\s*)+$/i.test(block)) {
+			return true;
+		}
+		// Standalone inline related article teasers: [READ ALSO ...](url) or [ALSO READ ...]
+		if (/^\[(?:READ ALSO|ALSO READ|SEE ALSO|RECOMMENDED|RELATED|MUST READ)[:\s][^\]]+\]\([^\)]+\)$/i.test(block)) {
+			return true;
+		}
+		// Social / WhatsApp channel promotional banners
+		if (/^\[.*(?:on WhatsApp|Join Now|Telegram Channel|WhatsApp Group|Get VIP Access).*\]\(https?:\/\/[^\)]+\)$/i.test(block)) {
+			return true;
+		}
+		// Standalone empty links: [](url)
+		if (/^\[\]\([^\)]+\)$/.test(block)) {
+			return true;
+		}
+		// Standalone logo or avatar image links
+		if (/^\[!\[Image \d+:[^\]]*\]\([^)]+\)\]\([^)]+\)$/.test(block) && (block.includes("logo") || block.includes("gravatar"))) {
+			return true;
+		}
+		// Pure navigation lists when no H1 was present:
+		if (/^\*\s+\[(?:Login|Download App|Home|Contact Us|About Us)\]/i.test(block)) {
+			return true;
+		}
+		return false;
+	};
+
+	const seenBlocks = new Set<string>();
+
+	for (let i = 0; i < rawBlocks.length; i++) {
+		const block = rawBlocks[i].trim();
+		if (!block) continue;
+
+		if (isTerminalFooterMarker(block)) {
+			break;
+		}
+
+		if (isInlineNoise(block)) {
+			continue;
+		}
+
+		// Avoid duplicate paragraphs within the substantive article
+		const normalizedForDedup = block.toLowerCase().replace(/\s+/g, " ");
+		if (seenBlocks.has(normalizedForDedup)) {
+			continue;
+		}
+		seenBlocks.add(normalizedForDedup);
+
+		cleanedBlocks.push(block);
+	}
+
+	return cleanedBlocks.join("\n\n");
+}
+
+/**
  * Extracts the full readable content of an article via Jina Reader API (https://r.jina.ai/).
  * Sends HTTP POST with JSON body containing the validated target URL.
  * Requests markdown output via X-Respond-With header.
@@ -479,9 +646,9 @@ export async function extractArticleWithJina(
 		};
 	}
 
-	// 6. Validate extracted content
-	const content = data.content;
-	if (typeof content !== "string" || !content.trim()) {
+	// 6. Validate and clean extracted content
+	const rawContent = data.content;
+	if (typeof rawContent !== "string" || !rawContent.trim()) {
 		return {
 			success: false,
 			status: 502,
@@ -489,15 +656,20 @@ export async function extractArticleWithJina(
 		};
 	}
 
-	const trimmedContent = content.trim();
-	const contentLength = trimmedContent.length;
-	const paragraphCount = countParagraphs(trimmedContent);
+	const normalizedContent = normalizeUnicodeText(rawContent);
+	const cleanedContent = cleanArticleMarkdown(normalizedContent, {
+		title: typeof data.title === "string" ? data.title : undefined,
+	});
+
+	const finalContent = cleanedContent.trim() || normalizedContent.trim();
+	const contentLength = finalContent.length;
+	const paragraphCount = countParagraphs(finalContent);
 
 	return {
 		success: true,
-		extracted_title: typeof data.title === "string" && data.title.trim() ? data.title.trim() : undefined,
+		extracted_title: typeof data.title === "string" && data.title.trim() ? normalizeUnicodeText(data.title.trim()) : undefined,
 		extracted_url: typeof data.url === "string" && data.url.trim() ? data.url.trim() : undefined,
-		content: trimmedContent,
+		content: finalContent,
 		content_length: contentLength,
 		paragraph_count: paragraphCount,
 		format: "markdown",

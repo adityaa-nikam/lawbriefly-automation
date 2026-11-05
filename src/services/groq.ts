@@ -61,7 +61,10 @@ LEGAL DOMAIN:
 Assign the most relevant legal domain strictly from the allowed enum:
 constitutional_law, criminal_law, civil_law, corporate_commercial_law, intellectual_property, technology_data_privacy_law, family_law, labour_employment_law, environmental_law, tax_law, administrative_regulatory_law, international_law, legal_education, legal_profession, other, not_applicable.
 For property, land disputes, contracts, torts, or homestead issues, use 'civil_law'. Never output domain values outside this enum.
-Do not force an irrelevant article into a legal category.
+Do not force an irrelevant article into a legal category:
+- For articles with relevance 'not_relevant', assign 'not_applicable'.
+- For articles with relevance 'uncertain', assign 'not_applicable' or 'other'.
+- CRITICAL: 'uncertain' is NOT a legal domain. Never assign 'legal_domain': 'uncertain'.
 TOPIC EXTRACTION:
 Group articles discussing the same underlying legal issue, court case, judgment, legislative development, regulatory action or related event.
 Important:
@@ -81,6 +84,9 @@ For each topic cluster in topic_clusters, assign 'emergence_status' strictly fro
 A case being dismissed, settled, rejected, concluded, or decided is an outcome. These words must never be emitted as emergence_status values.
 Do not automatically classify every recently published article as 'emerging'. Base the classification on the actual development and evidence.
 When uncertain or if the evidence does not clearly justify another category, use 'unclear'.
+CONFIDENCE:
+Every topic cluster must include a numeric 'confidence' value between 0.0 and 1.0 (e.g., 0.85, 0.90).
+You must strictly output decimal digits only. Never spell out numbers or write words (never output 'nine', 'zero point nine', etc.).
 ARTICLE PROVENANCE:
 Use only the article IDs provided in the input.
 Never invent article IDs.
@@ -801,7 +807,16 @@ async function executeGroqStructuredRequest<T>(
 		};
 	}
 
-	const firstChoice = choices[0] as { message?: { content?: unknown } };
+	const firstChoice = choices[0] as { message?: { content?: unknown }; finish_reason?: unknown };
+	const finishReason = firstChoice?.finish_reason;
+	if (finishReason === "length") {
+		return {
+			success: false,
+			status: 502,
+			error: "Groq response was truncated due to completion token limit (finish_reason: length)",
+		};
+	}
+
 	const rawContent = firstChoice?.message?.content;
 
 	if (typeof rawContent !== "string" || !rawContent.trim()) {
@@ -872,13 +887,13 @@ Instructions:
 1. Provide an assessment for every input article using its exact article_id. Keep each 'reason' concise (1-2 sentences).
 2. For each article assessment:
    - 'relevance' must be one of: relevant, not_relevant, uncertain.
-   - 'legal_domain' must strictly be one of: constitutional_law, criminal_law, civil_law, corporate_commercial_law, intellectual_property, technology_data_privacy_law, family_law, labour_employment_law, environmental_law, tax_law, administrative_regulatory_law, international_law, legal_education, legal_profession, other, not_applicable. (For property/land/homestead disputes, use 'civil_law'; never use unlisted names).
+   - 'legal_domain' must strictly be one of: constitutional_law, criminal_law, civil_law, corporate_commercial_law, intellectual_property, technology_data_privacy_law, family_law, labour_employment_law, environmental_law, tax_law, administrative_regulatory_law, international_law, legal_education, legal_profession, other, not_applicable. (For property/land/homestead disputes, use 'civil_law'; for non-relevant or uncertain articles, use 'not_applicable' or 'other'; 'uncertain' is NOT a legal domain).
    - 'jurisdiction' must be one of: india, international, both, unknown, not_applicable.
 3. Only articles classified with relevance 'relevant' may be included in topic_clusters.
 4. Every article with relevance 'not_relevant' or 'uncertain' MUST have cluster_id set to null, and must NEVER appear in any topic cluster's article_ids list.
 5. For every article that belongs to a topic cluster, its relevance MUST be 'relevant', its cluster_id in article_assessments must match that cluster's cluster_id, and its article_id must be included in that cluster's article_ids list.
 6. Every cluster_id assigned in article_assessments must exist as a cluster in topic_clusters. Keep topic summaries and editorial angles concise.
-7. For each cluster in topic_clusters, you MUST include all properties: cluster_id (string), topic_title (string), topic_summary (string), legal_domain (string enum), jurisdiction (string enum), significance (high, medium, or low), emergence_status (strictly one of: emerging, developing, ongoing, unclear; describes the lifecycle of the reported legal development, NOT procedural case outcomes; if uncertain or if evidence does not clearly justify another category, use unclear), editorial_angle (string), article_ids (array of strings containing the supporting article IDs), and confidence (number between 0 and 1). Never omit article_ids. A case being dismissed, settled, rejected, concluded, or decided is an outcome; these words must never be emitted as emergence_status values.
+7. For each cluster in topic_clusters, you MUST include all properties: cluster_id (string), topic_title (string), topic_summary (string), legal_domain (string enum), jurisdiction (string enum), significance (high, medium, or low), emergence_status (strictly one of: emerging, developing, ongoing, unclear; describes the lifecycle of the reported legal development, NOT procedural case outcomes; if uncertain or if evidence does not clearly justify another category, use unclear), editorial_angle (string), article_ids (array of strings containing the supporting article IDs), and confidence (numeric decimal literal strictly using digits between 0.0 and 1.0, e.g. 0.90; never spell out words like 'nine'). Never omit article_ids. A case being dismissed, settled, rejected, concluded, or decided is an outcome; these words must never be emitted as emergence_status values.
 
 Articles:
 ${JSON.stringify(sanitizedArticleInputs, null, 2)}`;
@@ -916,6 +931,7 @@ ${JSON.stringify(sanitizedArticleInputs, null, 2)}`;
 			result.errorCode === "json_validate_failed" ||
 			(typeof result.errorMessage === "string" &&
 				(result.errorMessage.includes("does not validate with") ||
+					result.errorMessage.includes("Failed to generate JSON") ||
 					result.errorMessage.includes("json_validate_failed")));
 
 		if (isSchemaValidationError) {
@@ -938,7 +954,9 @@ MANDATORY RULES FOR THIS RETRY ATTEMPT:
    A case being dismissed, settled, rejected, concluded, or decided is an outcome. These words must never be emitted as emergence_status values (never output outcome labels such as 'cleared', 'dismissed', 'settled', 'resolved', 'concluded').
    Do not automatically classify every recently published article as 'emerging'. Base the classification on the actual development and evidence. When uncertain, use 'unclear'.
 2. In 'article_assessments', 'relevance' must strictly be one of: 'relevant', 'not_relevant', 'uncertain'.
-3. All other enum fields ('legal_domain', 'jurisdiction', 'significance') must strictly match their allowed schema enum values.`;
+3. For 'legal_domain', you must strictly choose from the allowed enum. When 'relevance' is 'not_relevant' or 'uncertain', 'legal_domain' must be 'not_applicable' or 'other'. CRITICAL: 'uncertain' is NOT a legal_domain; NEVER output 'legal_domain': 'uncertain'.
+4. In 'topic_clusters', 'confidence' must strictly be a decimal numeric literal with digits only between 0.0 and 1.0 (e.g. 0.90). NEVER spell out words like 'nine'.
+5. All other enum fields ('jurisdiction', 'significance') must strictly match their allowed schema enum values.`;
 
 		const retryRequestBody = {
 			...requestBody,
