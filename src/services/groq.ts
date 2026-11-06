@@ -353,7 +353,7 @@ export type ResolveGroqModelResult =
  * returns a safe configuration error rather than silently falling back.
  */
 export function resolveGroqModel(env: Env): ResolveGroqModelResult {
-	const rawModel = env.GROQ_MODEL?.trim();
+	const rawModel = env.GROQ_MODEL?.trim().replace(/^["']|["']$/g, "");
 	if (!rawModel) {
 		return { success: true, model: DEFAULT_GROQ_MODEL };
 	}
@@ -756,6 +756,18 @@ async function executeGroqStructuredRequest<T>(
 				status: 502,
 				error: "Groq API authentication failed. Please check your GROQ_API_KEY.",
 			};
+		}
+		if (status === 429 || status === 413) {
+			const currentModel = typeof requestBody.model === "string" ? requestBody.model : "";
+			if (currentModel && currentModel !== DEFAULT_GROQ_MODEL) {
+				console.warn(
+					`[Groq Fallback] Model ${currentModel} returned HTTP ${status}. Retrying structured request with default model ${DEFAULT_GROQ_MODEL}...`
+				);
+				return await executeGroqStructuredRequest(apiKey, {
+					...requestBody,
+					model: DEFAULT_GROQ_MODEL,
+				});
+			}
 		}
 		if (status === 429) {
 			return {
