@@ -20,7 +20,7 @@ for (const line of lines) {
 
 async function testTopicSelection() {
 	console.log("Testing selectHotTopic with live env...");
-	const env = { ...vars, GROQ_MODEL: "qwen/qwen3.8-27b" } as unknown as Env;
+	const env = vars as unknown as Env;
 	const outcome = await selectHotTopic(env, {
 		collection_window_days: 7,
 		batch_size: 10,
@@ -30,10 +30,7 @@ async function testTopicSelection() {
 	console.log("Success:", outcome.success);
 	if (outcome.success) {
 		console.log("Selection status:", outcome.data.selection_status);
-		console.log("Topic title:", outcome.data.topic_title);
-		console.log("Topic summary:", outcome.data.topic_summary);
-		console.log("Article IDs:", outcome.data.article_ids);
-		console.log("Confidence:", outcome.data.confidence);
+		console.log("Selected topic:", JSON.stringify(outcome.data.selected_topic, null, 2));
 	} else {
 		console.log("Error status:", outcome.status);
 		console.log("Error message:", outcome.error);

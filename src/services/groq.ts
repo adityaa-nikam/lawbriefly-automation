@@ -742,8 +742,8 @@ async function executeGroqStructuredRequest<T>(
 				if (errBody?.error?.failed_generation) {
 					failedGeneration = errBody.error.failed_generation;
 				}
-				if (status === 400) {
-					console.error("Groq 400 details:", JSON.stringify(errBody));
+				if (status === 400 || status === 429) {
+					console.error(`Groq ${status} details:`, JSON.stringify(errBody));
 				}
 			} catch {
 				// Ignore parse error
@@ -934,7 +934,7 @@ ${JSON.stringify(sanitizedArticleInputs, null, 2)}`;
 			},
 		},
 		temperature: 0.2,
-		max_completion_tokens: 4096,
+		max_completion_tokens: 1800,
 		reasoning_effort: "low",
 	};
 	let result = await executeGroqStructuredRequest<RawGroqBatchAnalysis>(apiKey, requestBody);
@@ -998,10 +998,99 @@ MANDATORY RULES FOR THIS RETRY ATTEMPT:
 		};
 	}
 
+	const rawData = result.data;
+	if (rawData && Array.isArray(rawData.article_assessments)) {
+		const inputArticleIds = new Set(articles.map((a) => a.id));
+		const titleToId = new Map<string, string>();
+		for (const a of articles) {
+			titleToId.set(a.title.toLowerCase().trim(), a.id);
+			titleToId.set(a.title.toLowerCase().trim().replace(/[^a-z0-9]/g, ""), a.id);
+		}
+
+		// 1. Sanitize clusters: map any titles to article IDs and drop empty clusters
+		const articleToCluster = new Map<string, string>();
+		if (Array.isArray(rawData.topic_clusters)) {
+			const sanitizedClusters: TopicClusterRaw[] = [];
+			for (const cluster of rawData.topic_clusters) {
+				if (!cluster || !cluster.cluster_id || !Array.isArray(cluster.article_ids)) {
+					continue;
+				}
+				const sanitizedArtIds: string[] = [];
+				for (const rawArtId of cluster.article_ids) {
+					const trimmedArtId = String(rawArtId ?? "").trim();
+					if (inputArticleIds.has(trimmedArtId)) {
+						if (!sanitizedArtIds.includes(trimmedArtId)) sanitizedArtIds.push(trimmedArtId);
+					} else {
+						const lower = trimmedArtId.toLowerCase();
+						const alphanum = lower.replace(/[^a-z0-9]/g, "");
+						const resolved = titleToId.get(lower) || titleToId.get(alphanum);
+						if (resolved && inputArticleIds.has(resolved)) {
+							if (!sanitizedArtIds.includes(resolved)) sanitizedArtIds.push(resolved);
+						}
+					}
+				}
+
+				if (sanitizedArtIds.length > 0) {
+					cluster.article_ids = sanitizedArtIds;
+					sanitizedClusters.push(cluster);
+					for (const artId of sanitizedArtIds) {
+						if (!articleToCluster.has(artId)) {
+							articleToCluster.set(artId, String(cluster.cluster_id).trim());
+						}
+					}
+				}
+			}
+			rawData.topic_clusters = sanitizedClusters;
+		}
+
+		// 2. Sanitize assessments: resolve any titles, deduplicate, and reconcile cluster_id
+		const seenIds = new Set<string>();
+		const sanitizedAssessments: ArticleAssessment[] = [];
+
+		for (const ass of rawData.article_assessments) {
+			let artId = String(ass.article_id ?? "").trim();
+			if (!inputArticleIds.has(artId)) {
+				const lower = artId.toLowerCase();
+				const alphanum = lower.replace(/[^a-z0-9]/g, "");
+				const resolved = titleToId.get(lower) || titleToId.get(alphanum);
+				if (resolved && inputArticleIds.has(resolved)) {
+					artId = resolved;
+					ass.article_id = resolved;
+				}
+			}
+			if (inputArticleIds.has(artId) && !seenIds.has(artId)) {
+				seenIds.add(artId);
+				const expectedClusterId = articleToCluster.get(artId) ?? null;
+				ass.cluster_id = expectedClusterId;
+				if (expectedClusterId && ass.relevance !== "relevant") {
+					ass.relevance = "relevant";
+				}
+				sanitizedAssessments.push(ass);
+			}
+		}
+
+		// 3. Fallback for any omitted batch articles
+		for (const a of articles) {
+			if (!seenIds.has(a.id)) {
+				const expectedClusterId = articleToCluster.get(a.id) ?? null;
+				sanitizedAssessments.push({
+					article_id: a.id,
+					relevance: expectedClusterId ? "relevant" : "uncertain",
+					legal_domain: "other",
+					jurisdiction: "unknown",
+					reason: "Article assessment omitted in model batch analysis.",
+					cluster_id: expectedClusterId,
+				});
+			}
+		}
+
+		rawData.article_assessments = sanitizedAssessments;
+	}
+
 	return {
 		success: true,
 		model,
-		data: result.data,
+		data: rawData,
 	};
 }
 
@@ -1942,7 +2031,7 @@ CRITICAL INSTRUCTIONS FOR THIS GENERATION:
 			},
 		},
 		temperature: 0.2,
-		max_completion_tokens: 4096,
+		max_completion_tokens: 1800,
 		reasoning_effort: "low",
 	};
 	const result = await executeGroqStructuredRequest<RawGroqContentGeneration>(apiKey, requestBody);
