@@ -25,6 +25,7 @@ import {
 	callMercuryDecide,
 	resolveMercuryModel,
 } from "./mercury-decide";
+import { getSupabaseClient } from "./supabase";
 
 export interface EvidenceMetrics {
 	unique_article_count: number;
@@ -550,6 +551,14 @@ export async function selectHotTopic(
 						error: "Invalid query parameter: 'batch_size' must be an integer between 10 and 20 inclusive",
 					};
 				}
+			} else if (key === "limit") {
+				if (!isValidPositiveInteger(value)) {
+					return {
+						success: false,
+						status: 400,
+						error: "Invalid query parameter: 'limit' must be a positive integer",
+					};
+				}
 			}
 		}
 	} else if (options) {
@@ -565,6 +574,13 @@ export async function selectHotTopic(
 				success: false,
 				status: 400,
 				error: "Invalid query parameter: 'batch_size' must be an integer between 10 and 20 inclusive",
+			};
+		}
+		if (options.limit !== undefined && !isValidPositiveInteger(String(options.limit))) {
+			return {
+				success: false,
+				status: 400,
+				error: "Invalid query parameter: 'limit' must be a positive integer",
 			};
 		}
 	}
@@ -583,15 +599,71 @@ export async function selectHotTopic(
 		};
 	}
 
-	// 3. Retrieve batches using existing news-retrieval service
-	const retrievalOutcome = await getNewsBatches(env, options);
+	// 3. Query recently covered topics and articles from social_content_posts (last 7 days)
+	// to prevent duplicate coverage of the same legal stories across pipeline runs.
+	const coveredArticleIds = new Set<string>();
+	const coveredTopicTitles: string[] = [];
+	const isTestEnv = typeof process !== "undefined" && (process.env?.NODE_ENV === "test" || process.env?.VITEST === "true");
+
+	if (!isTestEnv && env.SUPABASE_URL && env.SUPABASE_SECRET_KEY) {
+		try {
+			const supabase = getSupabaseClient(env);
+			const sevenDaysAgo = new Date(Date.now() - 7 * 24 * 60 * 60 * 1000).toISOString();
+			const { data: recentPosts } = await supabase
+				.from("social_content_posts")
+				.select("topic_title, source_attributions")
+				.gte("created_at", sevenDaysAgo)
+				.order("created_at", { ascending: false })
+				.limit(30);
+
+			if (Array.isArray(recentPosts)) {
+				for (const p of recentPosts) {
+					if (p.topic_title && typeof p.topic_title === "string") {
+						const trimmed = p.topic_title.trim();
+						if (trimmed && !coveredTopicTitles.includes(trimmed)) {
+							coveredTopicTitles.push(trimmed);
+						}
+					}
+					if (Array.isArray(p.source_attributions)) {
+						for (const attr of p.source_attributions) {
+							if (attr?.article_id && typeof attr.article_id === "string") {
+								coveredArticleIds.add(attr.article_id.trim());
+							}
+						}
+					}
+				}
+			}
+		} catch {
+			// Non-fatal if Supabase query fails (e.g. unit tests or local simulation)
+		}
+	}
+
+	// 4. Retrieve batches using news-retrieval service with deduplication and limit
+	let effectiveRetrievalOptions: GetNewsBatchesOptions;
+	if (options instanceof URLSearchParams) {
+		effectiveRetrievalOptions = {
+			days: options.get("days") || undefined,
+			batch_size: options.get("batch_size") || undefined,
+			page_size: options.get("page_size") || undefined,
+			limit: options.get("limit") || 20,
+			exclude_article_ids: coveredArticleIds,
+		};
+	} else {
+		effectiveRetrievalOptions = {
+			...options,
+			limit: options?.limit ?? 20,
+			exclude_article_ids: options?.exclude_article_ids ?? coveredArticleIds,
+		};
+	}
+
+	const retrievalOutcome = await getNewsBatches(env, effectiveRetrievalOptions);
 	if (!retrievalOutcome.success) {
 		return retrievalOutcome;
 	}
 
 	const batchData = retrievalOutcome.data;
 
-	// 4. Handle zero articles cleanly without calling Groq or Mercury
+	// 5. Handle zero articles cleanly without calling Groq or Mercury
 	if (batchData.total_articles === 0) {
 		const reqModel = resolveMercuryModel(env);
 		return {
@@ -694,6 +766,30 @@ export async function selectHotTopic(
 		};
 	}
 
+	// 8b. Deduplicate and cap candidate clusters to protect Groq TPM budget and avoid repeating recently covered stories
+	let effectiveClusters = candidateClusters;
+	if (coveredTopicTitles.length > 0) {
+		const nonDuplicateClusters = effectiveClusters.filter((c) => {
+			const candLower = c.topic_title.toLowerCase();
+			return !coveredTopicTitles.some((t) => {
+				const coveredLower = t.toLowerCase();
+				return candLower.includes(coveredLower) || coveredLower.includes(candLower);
+			});
+		});
+		if (nonDuplicateClusters.length > 0) {
+			effectiveClusters = nonDuplicateClusters;
+		}
+	}
+
+	const significanceRank: Record<string, number> = { high: 3, medium: 2, low: 1 };
+	const rankedClusters = [...effectiveClusters].sort((a, b) => {
+		const rankA = significanceRank[a.significance] || 0;
+		const rankB = significanceRank[b.significance] || 0;
+		if (rankA !== rankB) return rankB - rankA;
+		return (b.confidence || 0) - (a.confidence || 0);
+	});
+	const topClusters = rankedClusters.slice(0, 5);
+
 	// 9. Prepare supporting relevant articles for prompt
 	const supportingArticlesForPrompt: CandidateArticleInput[] = [];
 	for (const [articleId, assessment] of assessmentsMap.entries()) {
@@ -719,8 +815,9 @@ export async function selectHotTopic(
 	// 10. Call Groq for candidate consolidation ONLY (merging related topics across batches)
 	await new Promise((resolve) => setTimeout(resolve, 2000));
 	const consolidationResult = await callGroqCandidateConsolidation(env, {
-		candidate_clusters: candidateClusters,
+		candidate_clusters: topClusters,
 		supporting_articles: supportingArticlesForPrompt,
+		covered_topics: coveredTopicTitles,
 	});
 
 	if (!consolidationResult.success) {
@@ -814,6 +911,7 @@ export async function selectHotTopic(
 			evidence: c.evidence_metrics,
 			supporting_article_titles: c.article_ids.map((id) => allArticlesMap.get(id)!.title),
 		})),
+		recently_covered_topics: coveredTopicTitles,
 	});
 
 	if (!mercuryOutcome.success) {

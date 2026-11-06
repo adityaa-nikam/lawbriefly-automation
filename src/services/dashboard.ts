@@ -343,10 +343,13 @@ export async function getDashboardState(env: Env): Promise<DashboardState> {
 		status: "not_reached",
 	};
 
-	const candidatePostId =
-		activeRun?.postId ||
-		effectiveLastRun?.postId ||
-		(recentRuns && recentRuns.length > 0 ? (recentRuns[0].post_id || recentRuns[0].postId) : undefined);
+	// Strict Run Isolation: If an active run is in progress, ONLY check publication for activeRun's postId.
+	// Never fall back to previous runs or database history while a new run is executing!
+	const candidatePostId = activeRun
+		? activeRun.postId
+		: effectiveLastRun?.postId ||
+		  (recentRuns && recentRuns.length > 0 ? (recentRuns[0].post_id || recentRuns[0].postId) : undefined);
+
 	if (candidatePostId) {
 		publicationInfo.postId = candidatePostId;
 		try {
@@ -386,39 +389,48 @@ export async function getDashboardState(env: Env): Promise<DashboardState> {
 		}
 	}
 
-	// Synchronize Stage 7 in activeRun or lastRun if available
+	// Synchronize Stage 7 in targetRun (activeRun or effectiveLastRun)
 	const targetRun = activeRun || effectiveLastRun;
 	if (targetRun) {
-		if (publicationInfo.status === "published") {
-			targetRun.stages["instagram_publication"] = {
-				stage: "instagram_publication",
-				status: "completed",
-				metadata: {
-					media_id: publicationInfo.instagramMediaId,
-					permalink: publicationInfo.instagramPermalink,
-					published_at: publicationInfo.publishedAt,
-				},
-			};
-		} else if (publicationInfo.status === "publication_failed") {
-			targetRun.stages["instagram_publication"] = {
-				stage: "instagram_publication",
-				status: "failed",
-				error: publicationInfo.errorMessage,
-			};
-		} else if (
-			publicationInfo.status === "queued_for_publishing" ||
-			publicationInfo.status === "publishing_in_progress"
-		) {
-			targetRun.stages["instagram_publication"] = {
-				stage: "instagram_publication",
-				status: "running",
-				metadata: { status: publicationInfo.status },
-			};
-		} else if (publicationInfo.status === "awaiting_editorial_approval") {
+		const targetPostId = targetRun.postId;
+		if (targetPostId && publicationInfo.postId === targetPostId) {
+			if (publicationInfo.status === "published") {
+				targetRun.stages["instagram_publication"] = {
+					stage: "instagram_publication",
+					status: "completed",
+					metadata: {
+						media_id: publicationInfo.instagramMediaId,
+						permalink: publicationInfo.instagramPermalink,
+						published_at: publicationInfo.publishedAt,
+					},
+				};
+			} else if (publicationInfo.status === "publication_failed") {
+				targetRun.stages["instagram_publication"] = {
+					stage: "instagram_publication",
+					status: "failed",
+					error: publicationInfo.errorMessage,
+				};
+			} else if (
+				publicationInfo.status === "queued_for_publishing" ||
+				publicationInfo.status === "publishing_in_progress"
+			) {
+				targetRun.stages["instagram_publication"] = {
+					stage: "instagram_publication",
+					status: "running",
+					metadata: { status: publicationInfo.status },
+				};
+			} else if (publicationInfo.status === "awaiting_editorial_approval") {
+				targetRun.stages["instagram_publication"] = {
+					stage: "instagram_publication",
+					status: "waiting",
+					metadata: { note: "Awaiting human editorial approval in Telegram" },
+				};
+			}
+		} else {
+			// If targetRun has not produced a postId or published yet, Stage 7 is strictly WAITING
 			targetRun.stages["instagram_publication"] = {
 				stage: "instagram_publication",
 				status: "waiting",
-				metadata: { note: "Awaiting human editorial approval in Telegram" },
 			};
 		}
 	}
@@ -958,6 +970,9 @@ export function renderDashboardHtml(): string {
 			<button id="btn-refresh" class="btn btn-secondary" onclick="fetchState(true)">
 				<span>🔄</span> Refresh State
 			</button>
+			<button id="btn-reset-view" class="btn btn-secondary" onclick="resetPipelineView()">
+				<span>✨</span> Clear Slate / Start Fresh
+			</button>
 			<span id="action-feedback" style="font-size: 12px; color: var(--text-muted); margin-left: 6px;"></span>
 		</div>
 
@@ -1474,7 +1489,8 @@ export function renderDashboardHtml(): string {
 			const destLinkContainer = document.getElementById("dest-link-container");
 
 			const pub = data.publication;
-			if (pub && pub.status !== "not_reached" && runToDisplay) {
+			const shouldShowBanner = pub && pub.status !== "not_reached" && runToDisplay && (!active || (active.postId && pub.postId === active.postId));
+			if (shouldShowBanner) {
 				destBanner.classList.add("visible");
 				destPostId.textContent = pub.postId || runToDisplay.postId || "--";
 				destMediaId.textContent = pub.instagramMediaId || "Pending Publication";
@@ -1508,8 +1524,7 @@ export function renderDashboardHtml(): string {
 					destIcon.textContent = "📬";
 					destTitle.textContent = "Awaiting Editorial Approval in Telegram";
 					destBody.textContent = "Slide album delivered to Telegram chat. Review in Telegram or approve directly below to publish.";
-					const targetPostId = pub.postId || (runToDisplay ? runToDisplay.postId : "");
-					destLinkContainer.innerHTML = '<button id="btn-approve-publish" class="btn btn-primary" onclick="approveAndPublish(\'' + targetPostId + '\')" style="background-color: var(--green); color: #000; font-weight: 700; font-size: 13px; margin-top: 10px; padding: 10px 18px; border: none; cursor: pointer; border-radius: 6px;">🚀 APPROVE &amp; PUBLISH TO INSTAGRAM NOW</button>';
+					destLinkContainer.innerHTML = '<button id="btn-approve-publish" class="btn btn-primary" onclick="approveAndPublish()" style="background-color: var(--green); color: #000; font-weight: 700; font-size: 13px; margin-top: 10px; padding: 10px 18px; border: none; cursor: pointer; border-radius: 6px;">🚀 APPROVE &amp; PUBLISH TO INSTAGRAM NOW</button>';
 				}
 			} else {
 				destBanner.classList.remove("visible");
@@ -1570,8 +1585,54 @@ export function renderDashboardHtml(): string {
 			document.getElementById("modal-news").classList.remove("open");
 		}
 
+		function resetPipelineView(isSilent) {
+			for (const s of STAGE_KEYS) {
+				const card = document.getElementById("card-" + s);
+				const badge = document.getElementById("badge-" + s);
+				const dur = document.getElementById("dur-" + s);
+				const errBox = document.getElementById("err-" + s);
+				if (card) card.className = "stage-card";
+				if (badge) {
+					badge.className = "stage-status-pill status-waiting";
+					badge.textContent = "WAITING";
+				}
+				if (dur) dur.textContent = "--";
+				if (errBox) errBox.classList.remove("visible");
+			}
+
+			const progressFill = document.getElementById("pipeline-progress-fill");
+			if (progressFill) {
+				progressFill.style.width = "0%";
+				progressFill.classList.remove("active");
+			}
+
+			const destBanner = document.getElementById("destination-banner");
+			if (destBanner) destBanner.classList.remove("visible");
+
+			const heading = document.getElementById("run-status-heading");
+			const sub = document.getElementById("run-meta-sub");
+			const overallBadge = document.getElementById("run-overall-badge");
+			const pulse = document.getElementById("live-pulse");
+
+			if (heading) heading.textContent = "Ready for New Pipeline Run";
+			if (sub) sub.textContent = "Click 'RUN FULL PIPELINE NOW' to initiate a fresh autonomous cycle.";
+			if (overallBadge) {
+				overallBadge.textContent = "READY";
+				overallBadge.className = "stage-status-pill status-waiting";
+			}
+			if (pulse) pulse.classList.remove("running");
+
+			const feedback = document.getElementById("action-feedback");
+			if (feedback && !isSilent) {
+				feedback.textContent = "Slate cleared. Ready for fresh pipeline run.";
+				feedback.style.color = "var(--text-muted)";
+				setTimeout(() => { feedback.textContent = ""; }, 4000);
+			}
+		}
+
 		async function confirmRunPipeline() {
 			closePipelineModal();
+			resetPipelineView(true);
 			const runBtn = document.getElementById("btn-run-pipeline");
 			const feedback = document.getElementById("action-feedback");
 			runBtn.disabled = true;
@@ -1616,7 +1677,7 @@ export function renderDashboardHtml(): string {
 				const res = await fetch("/api/dashboard/news-sync", {
 					method: "POST",
 					headers: { "Content-Type": "application/json" },
-					body: JSON.stringify({ days: "1", limit: "10" }),
+					body: JSON.stringify({ days: "3", limit: "20" }),
 				});
 				const data = await res.json();
 				if (!res.ok) {
@@ -1640,6 +1701,7 @@ export function renderDashboardHtml(): string {
 		}
 
 		async function approveAndPublish(postId) {
+			const targetId = postId || document.getElementById("dest-post-id")?.textContent?.trim() || "";
 			const btn = document.getElementById("btn-approve-publish");
 			if (btn) {
 				btn.disabled = true;
@@ -1649,7 +1711,7 @@ export function renderDashboardHtml(): string {
 				const res = await fetch("/api/dashboard/approve-and-publish", {
 					method: "POST",
 					headers: { "Content-Type": "application/json" },
-					body: JSON.stringify({ post_id: postId })
+					body: JSON.stringify({ post_id: targetId })
 				});
 				const data = await res.json();
 				if (data.success) {
@@ -1849,8 +1911,8 @@ export async function handleDashboardNewsSync(
 		});
 	}
 
-	let days = "1";
-	let limit = "10";
+	let days = "3";
+	let limit = "20";
 	try {
 		const text = await request.text();
 		if (text && text.trim().length > 0) {

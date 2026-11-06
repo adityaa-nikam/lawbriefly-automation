@@ -640,6 +640,7 @@ export interface CandidateArticleInput {
 export interface GlobalTopicSelectionPromptInput {
 	candidate_clusters: CandidateClusterInput[];
 	supporting_articles: CandidateArticleInput[];
+	covered_topics?: string[];
 }
 
 /**
@@ -690,7 +691,8 @@ async function executeGroqStructuredRequest<T>(
 		if ((response.status === 429 || response.status === 503) && attempt < maxRetries) {
 			const resetHeader =
 				response.headers.get("retry-after") ||
-				response.headers.get("x-ratelimit-reset-tokens");
+				response.headers.get("x-ratelimit-reset-tokens") ||
+				response.headers.get("x-ratelimit-reset-requests");
 			let delayMs = 1000;
 			if (resetHeader) {
 				const trimmed = resetHeader.trim();
@@ -1018,6 +1020,26 @@ export async function callGroqGlobalTopicSelection(
 	const model = modelResolution.model;
 
 	// 3. Format prompt with candidate clusters and supporting relevant articles
+	const sanitizedClusters = input.candidate_clusters.map((c) => ({
+		...c,
+		topic_summary:
+			c.topic_summary && c.topic_summary.length > 400
+				? `${c.topic_summary.slice(0, 400)}...`
+				: c.topic_summary,
+		editorial_angle:
+			c.editorial_angle && c.editorial_angle.length > 250
+				? `${c.editorial_angle.slice(0, 250)}...`
+				: c.editorial_angle,
+	}));
+
+	const sanitizedArticles = input.supporting_articles.map((a) => ({
+		...a,
+		description:
+			a.description && a.description.length > 400
+				? `${a.description.slice(0, 400)}...`
+				: a.description,
+	}));
+
 	const userContent = `Evaluate the candidate legal topics across all analyzed batches and select the single strongest legal topic for LawBriefly's audience.
 
 Instructions:
@@ -1030,11 +1052,11 @@ Instructions:
 7. If no candidate topic meets the editorial quality threshold, return selection_status "no_strong_topic", selection_kind "no_strong_topic", and selected_topic null.
 8. Provide alternative candidates considered with concise reasons for not selecting them.
 
-Candidate Topic Clusters (${input.candidate_clusters.length} total):
-${JSON.stringify(input.candidate_clusters, null, 2)}
+Candidate Topic Clusters (${sanitizedClusters.length} total):
+${JSON.stringify(sanitizedClusters, null, 2)}
 
-Supporting Articles (${input.supporting_articles.length} total):
-${JSON.stringify(input.supporting_articles, null, 2)}`;
+Supporting Articles (${sanitizedArticles.length} total):
+${JSON.stringify(sanitizedArticles, null, 2)}`;
 
 	const requestBody = {
 		model,
@@ -1238,28 +1260,65 @@ export async function callGroqCandidateConsolidation(
 	const model = modelResolution.model;
 
 	// 3. Format prompt with candidate clusters and supporting relevant articles
-	const userContent = `Consolidate candidate legal topics across all batches into a clean, deduplicated shortlist.
+	const sanitizedClusters = input.candidate_clusters.map((c) => ({
+		...c,
+		topic_summary:
+			c.topic_summary && c.topic_summary.length > 400
+				? `${c.topic_summary.slice(0, 400)}...`
+				: c.topic_summary,
+		editorial_angle:
+			c.editorial_angle && c.editorial_angle.length > 250
+				? `${c.editorial_angle.slice(0, 250)}...`
+				: c.editorial_angle,
+	}));
+
+	const sanitizedArticles = input.supporting_articles.map((a) => ({
+		...a,
+		description:
+			a.description && a.description.length > 400
+				? `${a.description.slice(0, 400)}...`
+				: a.description,
+	}));
+
+	const coveredTopicsInstruction =
+		input.covered_topics && input.covered_topics.length > 0
+			? `\n\nMANDATORY EDITORIAL DIVERSITY RULE:\nThe following topics have already been published recently on LawBriefly:\n${input.covered_topics.map((t) => `- "${t}"`).join("\n")}\nYou MUST NOT select, consolidate, or repeat any of these already-covered legal topics or developments under any circumstances. Select only other emerging legal developments from the remaining candidates.\n`
+			: "";
+
+	const userContent = `Consolidate candidate legal topics across all batches into a clean, deduplicated shortlist.${coveredTopicsInstruction}
 
 Instructions:
 1. Review all candidate clusters from all batches.
 2. If candidate clusters describe the same underlying legal issue, merge them and combine their supporting article IDs.
-3. For each consolidated topic:
+3. Consolidate into AT MOST 5 strongest distinct candidate topics.
+4. Keep each candidate topic concise: topic_summary (2-3 sentences), editorial_angle (1-2 sentences), and evidence_summary (2-3 sentences).
+5. For each consolidated topic:
    - Provide topic_title and topic_summary.
    - Specify legal_domain, jurisdiction, significance (high, medium, or low), and emergence_status (emerging, developing, ongoing, or unclear).
    - Provide editorial_angle for law students and evidence_summary describing the supporting facts and procedural stage.
    - List all supporting article_ids. Never omit article_ids.
-4. Only use article IDs present in the supporting articles list below. Do NOT invent article IDs or generate URLs.
-5. Never invent Supreme Court or High Court involvement. Never claim a court matter is pending unless the supplied articles explicitly establish that proceedings have been filed or are pending.
-6. Strictly distinguish between allegations, FIR registration, investigation, proposed challenges, filed petitions, and judicial judgments. Never convert allegations into established facts.
-7. DO NOT select a final winner or declare no_strong_topic. Another AI system (Mercury Decide) will evaluate these candidates.
-8. If no meaningful legal candidates exist across batches, return an empty candidate_topics array.
-9. Include quality_warnings as an array of strings noting any factual or evidence concerns, or an empty array [] if there are none.
+6. Only use article IDs present in the supporting articles list below. Do NOT invent article IDs or generate URLs.
+7. Never invent Supreme Court or High Court involvement. Never claim a court matter is pending unless the supplied articles explicitly establish that proceedings have been filed or are pending.
+8. Strictly distinguish between allegations, FIR registration, investigation, proposed challenges, filed petitions, and judicial judgments. Never convert allegations into established facts.
+9. DO NOT select a final winner or declare no_strong_topic. Another AI system (Mercury Decide) will evaluate these candidates.
+10. If no meaningful legal candidates exist across batches, return an empty candidate_topics array.
+11. Include quality_warnings as an array of strings noting any factual or evidence concerns, or an empty array [] if there are none.
 
-Candidate Topic Clusters (${input.candidate_clusters.length} total):
-${JSON.stringify(input.candidate_clusters, null, 2)}
+Candidate Topic Clusters (${sanitizedClusters.length} total):
+${JSON.stringify(sanitizedClusters, null, 2)}
 
-Supporting Articles (${input.supporting_articles.length} total):
-${JSON.stringify(input.supporting_articles, null, 2)}`;
+Supporting Articles (${sanitizedArticles.length} total):
+${JSON.stringify(sanitizedArticles, null, 2)}`;
+
+	// Estimate prompt tokens (~3.8 chars per token)
+	const estimatedPromptTokens = Math.ceil(
+		(GROQ_CANDIDATE_CONSOLIDATION_SYSTEM_PROMPT.length + userContent.length) / 3.8
+	);
+	// Groq TPM limit is 8000. Keep total requested tokens under 7500 while ensuring at least 3000 completion tokens.
+	const safeCompletionBudget = Math.min(
+		4096,
+		Math.max(3000, 7500 - estimatedPromptTokens)
+	);
 
 	const requestBody = {
 		model,
@@ -1282,7 +1341,7 @@ ${JSON.stringify(input.supporting_articles, null, 2)}`;
 			},
 		},
 		temperature: 0.2,
-		max_completion_tokens: 6144,
+		max_completion_tokens: safeCompletionBudget,
 		reasoning_effort: "low",
 	};
 	const result = await executeGroqStructuredRequest<RawGroqCandidateConsolidation>(apiKey, requestBody);

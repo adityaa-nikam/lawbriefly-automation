@@ -110,6 +110,28 @@ async function pollUpdates() {
 
 						const fwdBody = await fwdRes.text();
 						console.log(`[Bridge] Worker Response: HTTP ${fwdRes.status} -> ${fwdBody}`);
+
+						try {
+							const parsed = JSON.parse(fwdBody);
+							if (
+								parsed.success &&
+								parsed.action === "approve" &&
+								parsed.post_id &&
+								!parsed.auto_publish_dispatched
+							) {
+								console.log(`[Bridge] Auto-publish was not dispatched internally. Triggering direct publication for post ${parsed.post_id}...`);
+								const pubUrl = TARGET_URL.replace("/api/webhooks/telegram", "/api/ai/publish-instagram");
+								const pubRes = await fetch(pubUrl, {
+									method: "POST",
+									headers: { "Content-Type": "application/json" },
+									body: JSON.stringify({ post_id: parsed.post_id, prepare_only: false }),
+								});
+								const pubBody = await pubRes.text();
+								console.log(`[Bridge] Direct Publish Response: HTTP ${pubRes.status} -> ${pubBody}`);
+							}
+						} catch {
+							// non-json response
+						}
 					} catch (fwdErr: any) {
 						console.error(`[Bridge] Forwarding failed to ${TARGET_URL}:`, fwdErr.message);
 					}

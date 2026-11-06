@@ -527,8 +527,8 @@ export async function executePipeline(
 	};
 
 	try {
-		const days = options?.days !== undefined ? String(options.days) : "1";
-		const limit = options?.limit !== undefined ? String(options.limit) : "10";
+		const days = options?.days !== undefined ? String(options.days) : "3";
+		const limit = options?.limit !== undefined ? String(options.limit) : "20";
 
 		// Stage 1: News Ingestion
 		currentStageStartTime = Date.now();

@@ -32,6 +32,8 @@ export interface GetNewsBatchesOptions {
 	days?: number | string;
 	batch_size?: number | string;
 	page_size?: number | string;
+	limit?: number | string;
+	exclude_article_ids?: string[] | Set<string>;
 }
 
 export type GetNewsBatchesOutcome =
@@ -81,6 +83,7 @@ export async function getNewsBatches(
 	// 2. Parse and validate query parameters (defaults: days=3, batch_size=10)
 	let parsedDays = 3;
 	let parsedBatchSize = 10;
+	let parsedLimit: number | undefined = undefined;
 
 	if (options instanceof URLSearchParams) {
 		for (const [key, value] of options.entries()) {
@@ -102,6 +105,15 @@ export async function getNewsBatches(
 					};
 				}
 				parsedBatchSize = Number.parseInt(value.trim(), 10);
+			} else if (key === "limit") {
+				if (!isValidPositiveInteger(value)) {
+					return {
+						success: false,
+						status: 400,
+						error: "Invalid query parameter: 'limit' must be a positive integer",
+					};
+				}
+				parsedLimit = Number.parseInt(value.trim(), 10);
 			}
 		}
 	} else if (options) {
@@ -127,7 +139,25 @@ export async function getNewsBatches(
 			}
 			parsedBatchSize = Number.parseInt(batchSizeStr.trim(), 10);
 		}
+		if (options.limit !== undefined) {
+			const limitStr = String(options.limit);
+			if (!isValidPositiveInteger(limitStr)) {
+				return {
+					success: false,
+					status: 400,
+					error: "Invalid query parameter: 'limit' must be a positive integer",
+				};
+			}
+			parsedLimit = Number.parseInt(limitStr.trim(), 10);
+		}
 	}
+
+	const seenExcludes: Set<string> =
+		options && !(options instanceof URLSearchParams) && options.exclude_article_ids
+			? options.exclude_article_ids instanceof Set
+				? options.exclude_article_ids
+				: new Set(options.exclude_article_ids)
+			: new Set<string>();
 
 	// 3. Compute rolling UTC observation window based on last_seen_at
 	const now = new Date();
@@ -192,15 +222,27 @@ export async function getNewsBatches(
 		};
 	}
 
-	// 5. Partition articles into batches
-	const totalArticles = rawArticles.length;
+	// 5. Filter out excluded articles (e.g. recently covered) and apply limit
+	let eligibleArticles = rawArticles;
+	if (seenExcludes.size > 0) {
+		eligibleArticles = eligibleArticles.filter((item) => {
+			const rec = item as Record<string, unknown>;
+			return !seenExcludes.has(String(rec.id ?? ""));
+		});
+	}
+	if (parsedLimit !== undefined && parsedLimit > 0) {
+		eligibleArticles = eligibleArticles.slice(0, parsedLimit);
+	}
+
+	// 6. Partition articles into batches
+	const totalArticles = eligibleArticles.length;
 	const batches: NewsBatch[] = [];
 
 	if (totalArticles > 0) {
 		let batchIndex = 0;
 		for (let i = 0; i < totalArticles; i += parsedBatchSize) {
 			batchIndex++;
-			const chunk = rawArticles.slice(i, i + parsedBatchSize).map((item) => {
+			const chunk = eligibleArticles.slice(i, i + parsedBatchSize).map((item) => {
 				const rec = item as Record<string, unknown>;
 				return {
 					id: String(rec.id ?? ""),

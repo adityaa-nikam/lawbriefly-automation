@@ -72,6 +72,7 @@ export async function callMercuryDecide(
 	options: {
 		window_days: number;
 		candidates: MercuryCandidateInput[];
+		recently_covered_topics?: string[];
 	}
 ): Promise<MercuryDecisionOutcome> {
 	// 1. Verify OPENROUTER_API_KEY
@@ -130,7 +131,10 @@ export async function callMercuryDecide(
 			topic_selection: {
 				type: "choice",
 				instructions:
-					"Select the single most editorially valuable legal development for LawBriefly. Evaluate legal significance, supporting evidence, source diversity, relevance to Indian law students, and educational value. Do not equate article volume with legal importance. A single significant legal development can qualify without being a multi-source trend. Select no_strong_topic if none of the candidates merits selection.",
+					"Select the single most editorially valuable legal development for LawBriefly. Evaluate legal significance, supporting evidence, source diversity, relevance to Indian law students, and educational value. Do not equate article volume with legal importance. A single significant legal development can qualify without being a multi-source trend. Select no_strong_topic if none of the candidates merits selection." +
+					(options.recently_covered_topics && options.recently_covered_topics.length > 0
+						? ` MANDATORY EDITORIAL DIVERSITY RULE: The following topics have recently been published on LawBriefly: ${options.recently_covered_topics.slice(0, 5).map((t) => `"${t}"`).join(", ")}. Do NOT select any candidate that repeats or re-covers these legal developments under any circumstances. Select an entirely different legal topic or no_strong_topic.`
+						: ""),
 				criteria,
 			},
 		},
