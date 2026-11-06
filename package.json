@@ -9,7 +9,8 @@
     "test": "vitest run && vitest run --config vitest.node.config.mts",
     "test:workers": "vitest run",
     "test:renderer": "vitest run --config vitest.node.config.mts",
-    "cf-typegen": "wrangler types"
+    "cf-typegen": "wrangler types",
+    "telegram:bridge": "tsx scripts/telegram-local-bridge.ts"
   },
   "devDependencies": {
     "@cloudflare/puppeteer": "^1.4.0",

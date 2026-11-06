@@ -35,6 +35,7 @@ import {
 	handleDashboardRunDetails,
 	handleDashboardRunTrigger,
 	handleDashboardNewsSync,
+	handleDashboardApproveAndPublish,
 } from "./services/dashboard";
 
 export {
@@ -266,6 +267,10 @@ export default {
 
 		if (url.pathname === "/api/dashboard/news-sync" && request.method === "POST") {
 			return await handleDashboardNewsSync(request, env);
+		}
+
+		if (url.pathname === "/api/dashboard/approve-and-publish" && request.method === "POST") {
+			return await handleDashboardApproveAndPublish(request, env);
 		}
 
 		if (url.pathname === "/") {

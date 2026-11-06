@@ -11,6 +11,8 @@ import {
 import { executeNewsIngestion } from "./news-ingestion";
 import { getSupabaseClient, checkSupabaseHealth } from "./supabase";
 import { resolveGroqModel, DEFAULT_GROQ_MODEL } from "./groq";
+import { publishApprovedCarousel } from "./instagram-publishing";
+import { editMessageReplyMarkup, normalizeBotToken } from "./telegram-bot";
 
 export interface DashboardSchedule {
 	name: string;
@@ -274,6 +276,68 @@ export async function getDashboardState(env: Env): Promise<DashboardState> {
 		recentRuns = getRecentRunsList();
 	}
 
+	// Hydrate lastRun from recentRuns if in-memory isolate reloaded
+	let effectiveLastRun = lastRun;
+	if (!effectiveLastRun && !activeRun && recentRuns && recentRuns.length > 0) {
+		const latestDbRun = recentRuns[0];
+		const runId = latestDbRun.run_id || latestDbRun.runId;
+		if (runId) {
+			try {
+				const client = getSupabaseClient(env);
+				const { data: stageEvents } = await client
+					.from("pipeline_stage_events")
+					.select("*")
+					.eq("run_id", runId)
+					.order("created_at", { ascending: true });
+
+				const stages: Record<string, any> = {};
+				if (Array.isArray(stageEvents)) {
+					for (const ev of stageEvents) {
+						if (ev.stage) {
+							stages[ev.stage] = {
+								stage: ev.stage,
+								status: ev.status === "success" ? "completed" : ev.status,
+								startedAt: ev.created_at,
+								completedAt: ev.created_at,
+								durationMs: ev.duration_ms,
+								error: ev.error_message,
+								metadata: ev.metadata,
+							};
+						}
+					}
+				}
+
+				if (Object.keys(stages).length === 0 && latestDbRun.status === "completed") {
+					for (const s of [
+						"concurrency_lock",
+						"news_ingestion",
+						"topic_selection",
+						"content_generation",
+						"carousel_rendering",
+						"carousel_persistence",
+						"editorial_notification",
+					]) {
+						stages[s] = { stage: s, status: "completed" };
+					}
+				}
+
+				effectiveLastRun = {
+					runId: runId,
+					triggerType: latestDbRun.trigger_type || "manual",
+					overallStatus: latestDbRun.status || "completed",
+					startedAt: latestDbRun.started_at,
+					completedAt: latestDbRun.completed_at,
+					elapsedMs: latestDbRun.duration_ms || 0,
+					currentStage: latestDbRun.failed_stage || "instagram_publication",
+					postId: latestDbRun.post_id || latestDbRun.postId,
+					stages,
+				};
+			} catch {
+				// fallback
+			}
+		}
+	}
+
 	// 5. Post-Telegram Instagram Publishing Status Check (Final Pipeline Stage)
 	const publicationInfo: DashboardPublicationInfo = {
 		status: "not_reached",
@@ -281,8 +345,8 @@ export async function getDashboardState(env: Env): Promise<DashboardState> {
 
 	const candidatePostId =
 		activeRun?.postId ||
-		lastRun?.postId ||
-		(recentRuns && recentRuns.length > 0 ? recentRuns[0].postId : undefined);
+		effectiveLastRun?.postId ||
+		(recentRuns && recentRuns.length > 0 ? (recentRuns[0].post_id || recentRuns[0].postId) : undefined);
 	if (candidatePostId) {
 		publicationInfo.postId = candidatePostId;
 		try {
@@ -323,7 +387,7 @@ export async function getDashboardState(env: Env): Promise<DashboardState> {
 	}
 
 	// Synchronize Stage 7 in activeRun or lastRun if available
-	const targetRun = activeRun || lastRun;
+	const targetRun = activeRun || effectiveLastRun;
 	if (targetRun) {
 		if (publicationInfo.status === "published") {
 			targetRun.stages["instagram_publication"] = {
@@ -361,7 +425,7 @@ export async function getDashboardState(env: Env): Promise<DashboardState> {
 
 	return {
 		activeRun,
-		lastRun,
+		lastRun: effectiveLastRun,
 		publication: publicationInfo,
 		distributedLock: lockState,
 		groq: groqStatus,
@@ -1443,8 +1507,9 @@ export function renderDashboardHtml(): string {
 					destHeader.className = "dest-header awaiting";
 					destIcon.textContent = "📬";
 					destTitle.textContent = "Awaiting Editorial Approval in Telegram";
-					destBody.textContent = "Slide album delivered to Telegram chat. Review and click APPROVE to dispatch publication.";
-					destLinkContainer.innerHTML = "";
+					destBody.textContent = "Slide album delivered to Telegram chat. Review in Telegram or approve directly below to publish.";
+					const targetPostId = pub.postId || (runToDisplay ? runToDisplay.postId : "");
+					destLinkContainer.innerHTML = '<button id="btn-approve-publish" class="btn btn-primary" onclick="approveAndPublish(\'' + targetPostId + '\')" style="background-color: var(--green); color: #000; font-weight: 700; font-size: 13px; margin-top: 10px; padding: 10px 18px; border: none; cursor: pointer; border-radius: 6px;">🚀 APPROVE &amp; PUBLISH TO INSTAGRAM NOW</button>';
 				}
 			} else {
 				destBanner.classList.remove("visible");
@@ -1571,6 +1636,37 @@ export function renderDashboardHtml(): string {
 				syncBtn.disabled = false;
 				syncBtn.innerHTML = "<span>📰</span> SYNC NEWS ONLY";
 				fetchState();
+			}
+		}
+
+		async function approveAndPublish(postId) {
+			const btn = document.getElementById("btn-approve-publish");
+			if (btn) {
+				btn.disabled = true;
+				btn.textContent = "Publishing to Instagram...";
+			}
+			try {
+				const res = await fetch("/api/dashboard/approve-and-publish", {
+					method: "POST",
+					headers: { "Content-Type": "application/json" },
+					body: JSON.stringify({ post_id: postId })
+				});
+				const data = await res.json();
+				if (data.success) {
+					fetchState();
+				} else {
+					alert("Approval error: " + (data.error || "Unknown error"));
+					if (btn) {
+						btn.disabled = false;
+						btn.textContent = "🚀 APPROVE & PUBLISH TO INSTAGRAM NOW";
+					}
+				}
+			} catch (e) {
+				alert("Network error: " + e.message);
+				if (btn) {
+					btn.disabled = false;
+					btn.textContent = "🚀 APPROVE & PUBLISH TO INSTAGRAM NOW";
+				}
 			}
 		}
 
@@ -1772,4 +1868,120 @@ export async function handleDashboardNewsSync(
 		status,
 		headers: { "Content-Type": "application/json" },
 	});
+}
+
+export async function handleDashboardApproveAndPublish(
+	request: Request,
+	env: Env
+): Promise<Response> {
+	if (env.APP_ENV !== "development") {
+		return new Response(JSON.stringify({ error: "Not Found", status: 404 }), {
+			status: 404,
+			headers: { "Content-Type": "application/json" },
+		});
+	}
+
+	if (request.method !== "POST") {
+		return new Response(JSON.stringify({ error: "Method Not Allowed" }), {
+			status: 405,
+			headers: { "Content-Type": "application/json" },
+		});
+	}
+
+	let body: any = {};
+	try {
+		const text = await request.text();
+		if (text && text.trim().length > 0) {
+			body = JSON.parse(text);
+		}
+	} catch {
+		// empty body
+	}
+
+	const supabase = getSupabaseClient(env);
+	const targetPostId = body.post_id || getActiveRunProgress()?.postId || getLastRunProgress()?.postId;
+	if (!targetPostId) {
+		return new Response(
+			JSON.stringify({ success: false, error: "No post_id provided or available in recent runs." }),
+			{ status: 400, headers: { "Content-Type": "application/json" } }
+		);
+	}
+
+	try {
+		const now = new Date().toISOString();
+		// 1. Ensure approval request and post are approved in database
+		await supabase
+			.from("social_content_approval_requests")
+			.update({
+				decision_status: "approved",
+				decided_at: now,
+				decided_by_username: "Operator (Dashboard)",
+				updated_at: now,
+			})
+			.eq("post_id", targetPostId);
+
+		await supabase
+			.from("social_content_posts")
+			.update({
+				post_status: "approved",
+				updated_at: now,
+			})
+			.eq("id", targetPostId);
+
+		// 2. Publish to Instagram (reusing existing finished container or preparing fresh)
+		const publishResult = await publishApprovedCarousel(env, targetPostId, {
+			prepareOnly: false,
+			claimConfirmed: true,
+		});
+
+		// 3. Best-effort Telegram control message edit to reflect operator decision
+		try {
+			const { data: appReq } = await supabase
+				.from("social_content_approval_requests")
+				.select("telegram_chat_id, telegram_control_message_id")
+				.eq("post_id", targetPostId)
+				.maybeSingle();
+
+			if (appReq && appReq.telegram_chat_id && appReq.telegram_control_message_id && env.TELEGRAM_BOT_TOKEN) {
+				const botToken = normalizeBotToken(env.TELEGRAM_BOT_TOKEN);
+				await editMessageReplyMarkup(botToken, appReq.telegram_chat_id, appReq.telegram_control_message_id, {
+					inline_keyboard: [],
+				}).catch(() => {});
+			}
+		} catch {
+			// ignore telegram notification failure
+		}
+
+		// 4. Update in-memory run progress if applicable
+		const targetRun = getActiveRunProgress() || getLastRunProgress();
+		if (targetRun) {
+			targetRun.stages["instagram_publication"] = {
+				stage: "instagram_publication",
+				status: "completed",
+				metadata: {
+					media_id: publishResult.instagram_media_id,
+					permalink: publishResult.instagram_permalink,
+					published_at: now,
+				},
+			};
+		}
+
+		return new Response(
+			JSON.stringify({
+				success: true,
+				post_id: targetPostId,
+				instagram_media_id: publishResult.instagram_media_id,
+				instagram_permalink: publishResult.instagram_permalink,
+			}),
+			{ status: 200, headers: { "Content-Type": "application/json" } }
+		);
+	} catch (err: any) {
+		return new Response(
+			JSON.stringify({
+				success: false,
+				error: err?.message || "Failed to approve and publish to Instagram.",
+			}),
+			{ status: 500, headers: { "Content-Type": "application/json" } }
+		);
+	}
 }

@@ -923,7 +923,6 @@ ${JSON.stringify(sanitizedArticleInputs, null, 2)}`;
 		max_completion_tokens: 4096,
 		reasoning_effort: "low",
 	};
-
 	let result = await executeGroqStructuredRequest<RawGroqBatchAnalysis>(apiKey, requestBody);
 
 	// Bounded corrective retry for strict schema validation errors (e.g. invalid enum generation)
@@ -1286,7 +1285,6 @@ ${JSON.stringify(input.supporting_articles, null, 2)}`;
 		max_completion_tokens: 6144,
 		reasoning_effort: "low",
 	};
-
 	const result = await executeGroqStructuredRequest<RawGroqCandidateConsolidation>(apiKey, requestBody);
 	if (!result.success) {
 		return result;
@@ -1794,7 +1792,7 @@ export async function callGroqContentGeneration(
 	}
 	const model = modelResolution.model;
 
-	const maxCharsPerArticle = Math.min(10000, Math.floor(16000 / Math.max(1, input.articles.length)));
+	const maxCharsPerArticle = Math.min(1800, Math.floor(3600 / Math.max(1, input.articles.length)));
 
 	// 3. Format prompt with topic details and source article text
 	const isSingleSource = input.articles.length === 1;
@@ -1876,7 +1874,6 @@ CRITICAL INSTRUCTIONS FOR THIS GENERATION:
 		max_completion_tokens: 4096,
 		reasoning_effort: "low",
 	};
-
 	const result = await executeGroqStructuredRequest<RawGroqContentGeneration>(apiKey, requestBody);
 	if (!result.success) {
 		return result;
