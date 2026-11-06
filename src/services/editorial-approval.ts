@@ -24,6 +24,11 @@ import {
 	type TelegramMediaItem,
 } from "./telegram-bot";
 import * as instagramPublishing from "./instagram-publishing";
+import {
+	logOperationalEvent,
+	recordQueueProcessed,
+	recordQueueFailed,
+} from "./observability";
 
 export const DEFAULT_APPROVAL_TTL_HOURS = 72;
 export const UUID_REGEX = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
@@ -1627,12 +1632,45 @@ export async function handleInstagramPublishingQueue(
 	const supabase = getSupabaseClient(env);
 
 	for (const message of batch.messages) {
+		const startTime = Date.now();
 		const body = message.body;
 		const postId = body?.post_id;
 		const jobId = body?.job_id;
+		const messageId = message.id || `msg-${Date.now()}`;
+		const attempts = message.attempts || 1;
+
+		logOperationalEvent({
+			event: "queue_message_received",
+			timestamp: new Date().toISOString(),
+			trigger_type: "queue",
+			stage: "instagram_publishing_jobs",
+			status: "in_progress",
+			post_id: postId,
+			metadata: {
+				message_id: messageId,
+				job_id: jobId,
+				attempts,
+			},
+		});
 
 		if (!postId || typeof postId !== "string" || !UUID_REGEX.test(postId)) {
 			console.warn(`[Queue Consumer] Acknowledging invalid message payload: ${JSON.stringify(body)}`);
+			logOperationalEvent(
+				{
+					event: "queue_message_failed",
+					timestamp: new Date().toISOString(),
+					trigger_type: "queue",
+					stage: "instagram_publishing_jobs",
+					status: "failed",
+					post_id: postId,
+					duration_ms: Date.now() - startTime,
+					error_code: "INVALID_MESSAGE_PAYLOAD",
+					error_message: "Message payload missing or invalid post_id UUID",
+					metadata: { message_id: messageId, job_id: jobId, is_permanent: true },
+				},
+				"warn"
+			);
+			recordQueueFailed();
 			message.ack();
 			continue;
 		}
@@ -1646,18 +1684,61 @@ export async function handleInstagramPublishingQueue(
 
 		if (postErr || !post) {
 			console.warn(`[Queue Consumer] Post ${postId} not found in database. Acknowledging message.`);
+			logOperationalEvent(
+				{
+					event: "queue_message_failed",
+					timestamp: new Date().toISOString(),
+					trigger_type: "queue",
+					stage: "instagram_publishing_jobs",
+					status: "failed",
+					post_id: postId,
+					duration_ms: Date.now() - startTime,
+					error_code: "POST_NOT_FOUND",
+					error_message: `Post ${postId} not found in database`,
+					metadata: { message_id: messageId, job_id: jobId, is_permanent: true },
+				},
+				"warn"
+			);
+			recordQueueFailed();
 			message.ack();
 			continue;
 		}
 
 		if (post.post_status === "published" || post.instagram_media_id) {
 			console.log(`[Queue Consumer] Post ${postId} already published. Acknowledging message.`);
+			logOperationalEvent({
+				event: "queue_message_processed",
+				timestamp: new Date().toISOString(),
+				trigger_type: "queue",
+				stage: "instagram_publishing_jobs",
+				status: "success",
+				post_id: postId,
+				duration_ms: Date.now() - startTime,
+				metadata: { message_id: messageId, job_id: jobId, already_published: true },
+			});
+			recordQueueProcessed();
 			message.ack();
 			continue;
 		}
 
 		if (post.post_status !== "approved" || post.human_review_required !== true) {
 			console.warn(`[Queue Consumer] Post ${postId} is not approved or review not required (status: ${post.post_status}). Acknowledging without retry.`);
+			logOperationalEvent(
+				{
+					event: "queue_message_failed",
+					timestamp: new Date().toISOString(),
+					trigger_type: "queue",
+					stage: "instagram_publishing_jobs",
+					status: "failed",
+					post_id: postId,
+					duration_ms: Date.now() - startTime,
+					error_code: "POST_NOT_APPROVED",
+					error_message: `Post ${postId} is not approved or review not required (status: ${post.post_status})`,
+					metadata: { message_id: messageId, job_id: jobId, is_permanent: true },
+				},
+				"warn"
+			);
+			recordQueueFailed();
 			message.ack();
 			continue;
 		}
@@ -1665,6 +1746,22 @@ export async function handleInstagramPublishingQueue(
 		const slideCount = Number(post.carousel_slide_count);
 		if (isNaN(slideCount) || slideCount < 2 || slideCount > 10) {
 			console.warn(`[Queue Consumer] Post ${postId} slide count (${slideCount}) is not a carousel. Automatic publishing restricted to CAROUSEL only. Acknowledging.`);
+			logOperationalEvent(
+				{
+					event: "queue_message_failed",
+					timestamp: new Date().toISOString(),
+					trigger_type: "queue",
+					stage: "instagram_publishing_jobs",
+					status: "failed",
+					post_id: postId,
+					duration_ms: Date.now() - startTime,
+					error_code: "INVALID_SLIDE_COUNT",
+					error_message: `Post ${postId} slide count (${slideCount}) is not a carousel`,
+					metadata: { message_id: messageId, job_id: jobId, is_permanent: true },
+				},
+				"warn"
+			);
+			recordQueueFailed();
 			message.ack();
 			continue;
 		}
@@ -1672,6 +1769,22 @@ export async function handleInstagramPublishingQueue(
 		// Enforce allowlist / auto-publish guard
 		if (!isAutoPublishAllowed(env, postId)) {
 			console.warn(`[Queue Consumer] Post ${postId} is not in the auto-publish allowlist. Acknowledging message without publishing.`);
+			logOperationalEvent(
+				{
+					event: "queue_message_failed",
+					timestamp: new Date().toISOString(),
+					trigger_type: "queue",
+					stage: "instagram_publishing_jobs",
+					status: "failed",
+					post_id: postId,
+					duration_ms: Date.now() - startTime,
+					error_code: "ALLOWLIST_DENIED",
+					error_message: `Post ${postId} is not in the auto-publish allowlist`,
+					metadata: { message_id: messageId, job_id: jobId, is_permanent: true },
+				},
+				"warn"
+			);
+			recordQueueFailed();
 			message.ack();
 			continue;
 		}
@@ -1681,30 +1794,95 @@ export async function handleInstagramPublishingQueue(
 
 		if (claim.error_code === "ATOMIC_CLAIM_UNAVAILABLE" || claim.error_code === "ATOMIC_CLAIM_EXCEPTION") {
 			console.warn(`[Queue Consumer] Atomic claim RPC unavailable for post ${postId}: ${claim.error}. Retrying message in 30s.`);
+			logOperationalEvent({
+				event: "queue_message_retried",
+				timestamp: new Date().toISOString(),
+				trigger_type: "queue",
+				stage: "instagram_publishing_jobs",
+				post_id: postId,
+				duration_ms: Date.now() - startTime,
+				error_code: claim.error_code,
+				error_message: claim.error,
+				metadata: { message_id: messageId, job_id: jobId, retry_delay_seconds: 30, reason: "atomic_claim_unavailable" },
+			});
 			message.retry({ delaySeconds: 30 });
 			continue;
 		}
 
 		if (claim.is_already_published) {
 			console.log(`[Queue Consumer] Post ${postId} already marked published in publication records. Acknowledging.`);
+			logOperationalEvent({
+				event: "queue_message_processed",
+				timestamp: new Date().toISOString(),
+				trigger_type: "queue",
+				stage: "instagram_publishing_jobs",
+				status: "success",
+				post_id: postId,
+				duration_ms: Date.now() - startTime,
+				metadata: { message_id: messageId, job_id: jobId, already_published: true },
+			});
+			recordQueueProcessed();
 			message.ack();
 			continue;
 		}
 
 		if (claim.is_unknown) {
 			console.warn(`[Queue Consumer] Post ${postId} publication status is 'unknown'. Manual reconciliation required. Never blindly retrying.`);
+			logOperationalEvent(
+				{
+					event: "queue_message_failed",
+					timestamp: new Date().toISOString(),
+					trigger_type: "queue",
+					stage: "instagram_publishing_jobs",
+					status: "failed",
+					post_id: postId,
+					duration_ms: Date.now() - startTime,
+					error_code: "UNCERTAIN_OUTCOME_GUARD",
+					error_message: `Post ${postId} publication status is unknown; acknowledged to prevent duplicate publishing`,
+					metadata: { message_id: messageId, job_id: jobId, is_permanent: true },
+				},
+				"warn"
+			);
+			recordQueueFailed();
 			message.ack();
 			continue;
 		}
 
 		if (claim.in_progress) {
 			console.warn(`[Queue Consumer] Post ${postId} is currently in progress by another execution. Retrying with delay.`);
+			logOperationalEvent({
+				event: "queue_message_retried",
+				timestamp: new Date().toISOString(),
+				trigger_type: "queue",
+				stage: "instagram_publishing_jobs",
+				post_id: postId,
+				duration_ms: Date.now() - startTime,
+				error_code: "IN_PROGRESS",
+				error_message: `Post ${postId} publication is in progress by another worker isolate`,
+				metadata: { message_id: messageId, job_id: jobId, retry_delay_seconds: 60, reason: "in_progress" },
+			});
 			message.retry({ delaySeconds: 60 });
 			continue;
 		}
 
 		if (!claim.claimed) {
 			console.warn(`[Queue Consumer] Unable to claim publication job for post ${postId}: ${claim.error || claim.error_code}. Acknowledging.`);
+			logOperationalEvent(
+				{
+					event: "queue_message_failed",
+					timestamp: new Date().toISOString(),
+					trigger_type: "queue",
+					stage: "instagram_publishing_jobs",
+					status: "failed",
+					post_id: postId,
+					duration_ms: Date.now() - startTime,
+					error_code: claim.error_code || "CLAIM_FAILED",
+					error_message: claim.error || "Unable to claim publication job",
+					metadata: { message_id: messageId, job_id: jobId, is_permanent: true },
+				},
+				"warn"
+			);
+			recordQueueFailed();
 			message.ack();
 			continue;
 		}
@@ -1718,9 +1896,35 @@ export async function handleInstagramPublishingQueue(
 			});
 
 			if (result.success) {
+				const durationMs = Date.now() - startTime;
+				logOperationalEvent({
+					event: "queue_message_processed",
+					timestamp: new Date().toISOString(),
+					trigger_type: "queue",
+					stage: "instagram_publishing_jobs",
+					status: "success",
+					post_id: postId,
+					duration_ms: durationMs,
+					metadata: {
+						message_id: messageId,
+						job_id: jobId,
+						instagram_media_id: result.instagram_media_id,
+					},
+				});
+				recordQueueProcessed();
 				message.ack();
 				console.log(`[Queue Consumer] Successfully published post ${postId} to Instagram! media_id: ${result.instagram_media_id}`);
 			} else {
+				logOperationalEvent({
+					event: "queue_message_retried",
+					timestamp: new Date().toISOString(),
+					trigger_type: "queue",
+					stage: "instagram_publishing_jobs",
+					post_id: postId,
+					duration_ms: Date.now() - startTime,
+					error_message: "publishApprovedCarousel returned success=false",
+					metadata: { message_id: messageId, job_id: jobId, retry_delay_seconds: 30 },
+				});
 				message.retry({ delaySeconds: 30 });
 			}
 		} catch (err: any) {
@@ -1743,18 +1947,56 @@ export async function handleInstagramPublishingQueue(
 
 			if (isUnknownOutcome || checkPub?.publication_status === "unknown") {
 				console.warn(`[Queue Consumer] Post ${postId} outcome is uncertain. Acknowledging message to prevent duplicate Instagram post.`);
+				logOperationalEvent(
+					{
+						event: "queue_message_failed",
+						timestamp: new Date().toISOString(),
+						trigger_type: "queue",
+						stage: "instagram_publishing_jobs",
+						status: "failed",
+						post_id: postId,
+						duration_ms: Date.now() - startTime,
+						error_code: "UNCERTAIN_OUTCOME_GUARD",
+						error_message: errMsg,
+						metadata: { message_id: messageId, job_id: jobId, is_permanent: true },
+					},
+					"warn"
+				);
+				recordQueueFailed();
 				message.ack();
 				continue;
 			}
 
 			if (errMsg.includes("already been published") || checkPub?.publication_status === "published") {
 				console.log(`[Queue Consumer] Post ${postId} already published. Acknowledging.`);
+				logOperationalEvent({
+					event: "queue_message_processed",
+					timestamp: new Date().toISOString(),
+					trigger_type: "queue",
+					stage: "instagram_publishing_jobs",
+					status: "success",
+					post_id: postId,
+					duration_ms: Date.now() - startTime,
+					metadata: { message_id: messageId, job_id: jobId, already_published: true },
+				});
+				recordQueueProcessed();
 				message.ack();
 				continue;
 			}
 
 			if (errMsg.includes("currently in progress")) {
 				console.warn(`[Queue Consumer] Post ${postId} currently in progress. Retrying in 60s.`);
+				logOperationalEvent({
+					event: "queue_message_retried",
+					timestamp: new Date().toISOString(),
+					trigger_type: "queue",
+					stage: "instagram_publishing_jobs",
+					post_id: postId,
+					duration_ms: Date.now() - startTime,
+					error_code: "IN_PROGRESS",
+					error_message: errMsg,
+					metadata: { message_id: messageId, job_id: jobId, retry_delay_seconds: 60, reason: "in_progress" },
+				});
 				message.retry({ delaySeconds: 60 });
 				continue;
 			}
@@ -1767,12 +2009,39 @@ export async function handleInstagramPublishingQueue(
 
 			if (isPermanent) {
 				console.warn(`[Queue Consumer] Permanent validation failure for post ${postId}. Acknowledging.`);
+				logOperationalEvent(
+					{
+						event: "queue_message_failed",
+						timestamp: new Date().toISOString(),
+						trigger_type: "queue",
+						stage: "instagram_publishing_jobs",
+						status: "failed",
+						post_id: postId,
+						duration_ms: Date.now() - startTime,
+						error_code: "PERMANENT_PUBLISHING_FAILURE",
+						error_message: errMsg,
+						metadata: { message_id: messageId, job_id: jobId, is_permanent: true },
+					},
+					"warn"
+				);
+				recordQueueFailed();
 				message.ack();
 				continue;
 			}
 
 			// Transient failure before media_publish: retry with backoff
 			console.warn(`[Queue Consumer] Transient error for post ${postId}. Requesting queue retry (delay: 30s).`);
+			logOperationalEvent({
+				event: "queue_message_retried",
+				timestamp: new Date().toISOString(),
+				trigger_type: "queue",
+				stage: "instagram_publishing_jobs",
+				post_id: postId,
+				duration_ms: Date.now() - startTime,
+				error_code: "TRANSIENT_RETRY",
+				error_message: errMsg,
+				metadata: { message_id: messageId, job_id: jobId, retry_delay_seconds: 30 },
+			});
 			message.retry({ delaySeconds: 30 });
 		}
 	}

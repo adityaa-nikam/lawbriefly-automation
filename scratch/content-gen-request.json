@@ -1,0 +1,28 @@
+{
+  "selected_topic": {
+    "candidate_id": "T001",
+    "topic_title": "Supreme Court Review of Protest Site Occupation",
+    "topic_summary": "The Supreme Court on Tuesday sought responses from the Centre and other parties on a plea by traders seeking restrictions on an anti-CEC demonstration during the festive season, observing that designated protest sites cannot remain occupied indefinitely.",
+    "legal_domain": "constitutional_law",
+    "jurisdiction": "india",
+    "editorial_angle": "Balancing the constitutional right to protest with public order, access to commercial spaces, and regulation of designated protest sites.",
+    "selection_rationale": "High constitutional significance regarding the regulation of public protest grounds versus rights of local residents and commercial establishments.",
+    "confidence": 0.5463889388246501,
+    "evidence_metrics": {
+      "unique_article_count": 1,
+      "unique_source_host_count": 1,
+      "supporting_batch_count": 1,
+      "evidence_strength": "limited_evidence"
+    },
+    "supporting_articles": [
+      {
+        "article_id": "1d5fd141-4aab-4d35-930b-23617ba0fcc9",
+        "title": "Supreme Court Seeks Responses on Traders’ Plea Against Anti-CEC Protest, Says Protest Sites Cannot Be Occupied Indefinitely",
+        "description": "The Supreme Court on Tuesday sought responses from the Centre and other parties on a petition filed by traders’ organisations seeking restrictions on the ongoing protest against the Chief Election Commissioner (CEC) during the festive season. The Court observed that designated protest sites cannot remain occupied indefinitely and that different groups must have an opportunity to exercise their right to protest.",
+        "url": "https://lawtrend.in/supreme-court-seeks-responses-on-traders-plea-against-anti-cec-protest-says-protest-sites-cannot-be-occupied-indefinitely/",
+        "last_seen_at": "2026-11-04T01:05:45.650713+00:00"
+      }
+    ]
+  }
+}
+

@@ -16709,6 +16709,7 @@ CLOSE
 				});
 
 				vi.spyOn(supabaseModule, "getSupabaseClient").mockReturnValue(mockSupabase.mockClient as any);
+				setupTelegramFetchMock();
 
 				const update: TelegramUpdate = {
 					update_id: 99999,

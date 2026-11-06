@@ -24,3 +24,32 @@ TELEGRAM_CHAT_ID="-1001234567890"
 TELEGRAM_ALLOWED_USER_IDS="123456789,987654321"
 TELEGRAM_WEBHOOK_SECRET="YOUR_TELEGRAM_WEBHOOK_SECRET"
 TELEGRAM_APPROVAL_TTL_HOURS="72"
+
+# Autonomous Content Pipeline Cron Scheduling (Task 19)
+# Set strictly to "true" to enable daily scheduled execution (0 2 * * * / 07:30 AM IST).
+# Default is false/disabled. Local development defaults to disabled.
+AUTONOMOUS_PIPELINE_ENABLED="false"
+
+# Operational Alerting (Task 20)
+# Set strictly to "true" to enable Telegram operational failure alerts.
+# Default is false/disabled.
+OPS_ALERTS_ENABLED="false"
+# Optional: Dedicated Telegram chat for operational alerts (defaults to TELEGRAM_CHAT_ID if omitted)
+# TELEGRAM_OPS_ALERT_CHAT_ID="-1009876543210"
+
+# Instagram Publishing Variables (Task 17 & 18)
+# Mandatory safety control: Keep false to require manual review and approval.
+INSTAGRAM_AUTH_MODE="instagram_login"
+INSTAGRAM_ACCESS_TOKEN="YOUR_INSTAGRAM_GRAPH_ACCESS_TOKEN"
+INSTAGRAM_ACCOUNT_ID="YOUR_INSTAGRAM_BUSINESS_ACCOUNT_ID"
+INSTAGRAM_USER_ID="YOUR_INSTAGRAM_USER_ID"
+INSTAGRAM_GRAPH_VERSION="v26.0"
+INSTAGRAM_AUTO_PUBLISH_ON_APPROVAL="false"
+# Optional: comma-separated post UUIDs for controlled single-post live testing
+INSTAGRAM_AUTO_PUBLISH_POST_ALLOWLIST=""
+META_APP_ID="YOUR_META_APP_ID"
+META_APP_SECRET="YOUR_META_APP_SECRET"
+
+# Administrative Operator Security (Task 21)
+# Secret key used for authenticating administrative actions (e.g. DLQ recovery replay).
+ADMIN_API_KEY="YOUR_ADMIN_OPERATOR_API_KEY"

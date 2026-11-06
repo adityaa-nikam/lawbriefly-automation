@@ -6,6 +6,7 @@ export const GROQ_API_URL = "https://api.groq.com/openai/v1/chat/completions";
 export const ALLOWED_GROQ_MODELS = [
 	"openai/gpt-oss-20b",
 	"openai/gpt-oss-120b",
+	"qwen/qwen3.8-27b",
 ] as const;
 
 export type AllowedGroqModel = (typeof ALLOWED_GROQ_MODELS)[number];

@@ -11,13 +11,12 @@
 		"enabled": true
 	},
 	"upload_source_maps": true,
-	/**
-	 * Cron Triggers (UTC)
-	 * "30 0 * * *" executes daily at 00:30 UTC (06:00 AM IST) for news sync
-	 * every 15 minutes executes for stranded publishing outbox recovery
-	 */
+	// Cron Triggers (UTC):
+	// "30 0 * * *" executes daily at 00:30 UTC (06:00 AM IST) for news sync
+	// "0 2 * * *" executes daily at 02:00 UTC (07:30 AM IST) for autonomous AI pipeline (Task 19)
+	// "*/15 * * * *" executes every 15 minutes for stranded publishing outbox recovery
 	"triggers": {
-		"crons": ["30 0 * * *", "*/15 * * * *"]
+		"crons": ["30 0 * * *", "0 2 * * *", "*/15 * * * *"]
 	},
 	"browser": {
 		"binding": "MYBROWSER"
@@ -30,6 +29,10 @@
 			{
 				"binding": "INSTAGRAM_PUBLISHING_QUEUE",
 				"queue": "instagram-publishing-jobs"
+			},
+			{
+				"binding": "INSTAGRAM_QUARANTINE_QUEUE",
+				"queue": "instagram-publishing-quarantine"
 			}
 		],
 		"consumers": [
@@ -40,6 +43,15 @@
 				"max_retries": 3,
 				"retry_delay": 30,
 				"dead_letter_queue": "instagram-publishing-dlq",
+				"max_concurrency": 1
+			},
+			{
+				"queue": "instagram-publishing-dlq",
+				"max_batch_size": 1,
+				"max_batch_timeout": 5,
+				"max_retries": 3,
+				"retry_delay": 60,
+				"dead_letter_queue": "instagram-publishing-quarantine",
 				"max_concurrency": 1
 			}
 		]
